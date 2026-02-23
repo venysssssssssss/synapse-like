@@ -34,7 +34,7 @@ git push origin v0.2.0
 Quando a tag `v*` for enviada:
 
 - GitHub Actions executa o workflow `release`
-- gera o tarball Linux
+- gera o tarball Linux e o executavel usando a versao da tag
 - cria/atualiza a release no GitHub
 - anexa os arquivos para download
 

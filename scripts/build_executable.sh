@@ -7,7 +7,10 @@ DIST_DIR="$PROJECT_ROOT/dist"
 BUILD_DIR="$PROJECT_ROOT/build"
 ENTRY_FILE="$PROJECT_ROOT/scripts/gui_entry.py"
 
-VERSION="$(python3 - <<'PY'
+if [[ -n "${RELEASE_VERSION:-}" ]]; then
+    VERSION="${RELEASE_VERSION#v}"
+else
+    VERSION="$(python3 - <<'PY'
 import pathlib
 import tomllib
 
@@ -15,6 +18,7 @@ data = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
 print(data["tool"]["poetry"]["version"])
 PY
 )"
+fi
 
 BIN_NAME="synapse-like"
 OUTPUT_NAME="synapse-like-${VERSION}-linux-x86_64"

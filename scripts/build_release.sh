@@ -5,7 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DIST_DIR="$PROJECT_ROOT/dist"
 
-VERSION="$(python3 - <<'PY'
+if [[ -n "${RELEASE_VERSION:-}" ]]; then
+    VERSION="${RELEASE_VERSION#v}"
+else
+    VERSION="$(python3 - <<'PY'
 import pathlib
 import tomllib
 
@@ -14,6 +17,7 @@ data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 print(data["tool"]["poetry"]["version"])
 PY
 )"
+fi
 
 PKG_NAME="synapse-like-${VERSION}-linux"
 STAGE_ROOT="$(mktemp -d)"
