@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Synapse-Like
+Comment=Open-source Synapse-like for Linux
+Exec=bash -lc "cd '/home/kali/BIG/synapse-like' && poetry run synapse gui"
+Path=/home/kali/BIG/synapse-like
+Icon=synapse-like
+Terminal=false
+Categories=Settings;Utility;
+Keywords=Razer;Synapse;Keyboard;Mouse;Remap;
+StartupNotify=true
+StartupWMClass=Synapse-Like

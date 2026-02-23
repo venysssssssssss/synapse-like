@@ -4,7 +4,7 @@ import queue
 import select
 import threading
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from evdev import InputDevice, ecodes
 from PySide6.QtCore import QTimer
@@ -41,6 +41,7 @@ from synapse_like.gui.constants import (
 )
 from synapse_like.gui.device_paths import card_name, detect_razer_devices, expand_related_paths, path_kind
 from synapse_like.gui.dialogs import ActionDialog
+from synapse_like.gui.icons import build_app_icon
 from synapse_like.gui.mapping_io import load_mapping_file, save_mapping_file
 from synapse_like.gui.theme import STYLE_SHEET
 from synapse_like.gui.utils import event_code_name
@@ -52,9 +53,10 @@ logger = logging.getLogger(__name__)
 
 
 class RemapGUI(QWidget):
-    def __init__(self):
+    def __init__(self, app_icon=None):
         super().__init__()
         self.setWindowTitle("Synapse-Like")
+        self.setWindowIcon(app_icon or build_app_icon())
         self.resize(1400, 860)
 
         # Default mappings for BlackWidow Ultimate 2013 (M1=F13, M2=F14).
@@ -87,6 +89,14 @@ class RemapGUI(QWidget):
         self.capture_timer.setInterval(100)
         self.capture_timer.timeout.connect(self._poll_capture_queue)
         self.capture_timer.start()
+
+        self.service_thread: threading.Thread | None = None
+        self.service_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
+        self.service_busy = False
+        self.service_timer = QTimer(self)
+        self.service_timer.setInterval(40)
+        self.service_timer.timeout.connect(self._poll_service_queue)
+        self.service_timer.start()
 
         self._build_ui()
         self._apply_theme()
@@ -643,59 +653,182 @@ class RemapGUI(QWidget):
             self._refresh_label_visual(label)
 
     def _apply(self):
+        if self.service_busy:
+            self.status_label.setText("Aguarde: operacao em andamento.")
+            return
+
         self._stop_capture()
-        self._stop()
         device = self.device_input.text().strip()
         if not device:
             QMessageBox.warning(self, "Device", "Informe o caminho do device.")
             return
 
-        paths = expand_related_paths(device)
-        if not paths:
-            QMessageBox.warning(self, "Device", "Nenhum device de evento foi encontrado.")
+        self._set_service_busy(True, "Aplicando remapper...")
+        current_mappers = self.mappers
+        self.mappers = []
+        self._run_service_task(
+            target=self._apply_worker,
+            kwargs={
+                "device": device,
+                "mappings": dict(self.mappings),
+                "previous_mappers": current_mappers,
+            },
+        )
+
+    def _stop(self):
+        if self.service_busy:
+            self.status_label.setText("Aguarde: operacao em andamento.")
+            return
+        if not self.mappers:
+            self.status_label.setText("Remapper parado.")
             return
 
-        paths = self._filter_paths_for_mappings(paths)
-        low_latency = is_aux_pointer_only_mapping(self.mappings)
-        failures = []
-        logger.info("Applying mapper with %d mapping entries", len(self.mappings))
+        self._set_service_busy(True, "Parando remapper...")
+        current_mappers = self.mappers
+        self.mappers = []
+        self._run_service_task(
+            target=self._stop_worker,
+            kwargs={"mappers": current_mappers},
+        )
+
+    def _set_service_busy(self, busy: bool, status: str | None = None):
+        self.service_busy = busy
+        widgets = [
+            self.apply_btn,
+            self.stop_btn,
+            self.load_btn,
+            self.save_btn,
+            self.learn_mx_btn,
+            self.learn_all_btn,
+            self.device_combo,
+            self.device_input,
+        ]
+        for widget in widgets:
+            widget.setEnabled(not busy)
+        if status:
+            self.status_label.setText(status)
+
+    def _run_service_task(self, target, kwargs: Dict[str, Any]):
+        self.service_thread = threading.Thread(target=target, kwargs=kwargs, daemon=True)
+        self.service_thread.start()
+
+    def _apply_worker(
+        self,
+        device: str,
+        mappings: Dict[str, Action],
+        previous_mappers: List[InputMapper],
+    ):
+        failures: List[str] = []
+        started: List[InputMapper] = []
+        low_latency = is_aux_pointer_only_mapping(mappings)
+
+        for mapper in previous_mappers:
+            try:
+                mapper.stop()
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"stop: {exc}")
+
+        paths = expand_related_paths(device)
+        if not paths:
+            self.service_queue.put(
+                {
+                    "kind": "apply_done",
+                    "mappers": [],
+                    "failures": failures or ["Nenhum device de evento foi encontrado."],
+                    "low_latency": low_latency,
+                    "paths": [],
+                }
+            )
+            return
+
+        paths = self._filter_paths_for_mappings(paths, mappings)
+        logger.info("Applying mapper with %d mapping entries", len(mappings))
         logger.info("Mapper paths: %s", ", ".join(paths))
         logger.info("Low-latency mode: %s", "enabled" if low_latency else "disabled")
+
         for path in paths:
             try:
                 use_fast_mode = low_latency and "-if" in path
                 mapper = InputMapper(
                     MappingConfig(
                         device_path=path,
-                        mappings=self.mappings,
+                        mappings=mappings,
                         grab=not use_fast_mode,
                         passthrough=not use_fast_mode,
                     )
                 )
                 mapper.start()
-                self.mappers.append(mapper)
+                started.append(mapper)
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{path}: {exc}")
 
+        self.service_queue.put(
+            {
+                "kind": "apply_done",
+                "mappers": started,
+                "failures": failures,
+                "low_latency": low_latency,
+                "paths": paths,
+            }
+        )
+
+    def _stop_worker(self, mappers: List[InputMapper]):
+        failures: List[str] = []
+        for mapper in mappers:
+            try:
+                mapper.stop()
+            except Exception as exc:  # noqa: BLE001
+                failures.append(str(exc))
+        self.service_queue.put({"kind": "stop_done", "failures": failures})
+
+    def _poll_service_queue(self):
+        while True:
+            try:
+                item = self.service_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = item.get("kind")
+            if kind == "apply_done":
+                self._handle_apply_done(item)
+            elif kind == "stop_done":
+                self._handle_stop_done(item)
+
+    def _handle_apply_done(self, result: Dict[str, Any]):
+        self._set_service_busy(False)
+        self.mappers = result.get("mappers", [])
+        failures = result.get("failures", [])
         if not self.mappers:
-            QMessageBox.critical(self, "Erro", "Falha ao iniciar remapper:\n" + "\n".join(failures))
+            QMessageBox.critical(
+                self,
+                "Erro",
+                "Falha ao iniciar remapper:\n" + "\n".join(failures or ["Erro desconhecido"]),
+            )
+            self.status_label.setText("Remapper parado.")
             return
+
         if failures:
             QMessageBox.warning(self, "Aviso", "Interfaces nao iniciaram:\n" + "\n".join(failures))
+        low_latency = result.get("low_latency", False)
         mode_text = " (modo baixa latencia)" if low_latency else ""
         self.status_label.setText(
             f"Remapper ativo em {len(self.mappers)} interface(s).{mode_text}"
         )
 
-    def _stop(self):
-        if not self.mappers:
-            self.status_label.setText("Remapper parado.")
-            return
-
-        for mapper in self.mappers:
-            mapper.stop()
-        self.mappers = []
+    def _handle_stop_done(self, result: Dict[str, Any]):
+        self._set_service_busy(False)
+        failures = result.get("failures", [])
+        if failures:
+            QMessageBox.warning(self, "Aviso", "Falhas ao parar:\n" + "\n".join(failures))
         self.status_label.setText("Remapper parado.")
+
+    def _stop_sync(self):
+        for mapper in self.mappers:
+            try:
+                mapper.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self.mappers = []
 
     def _populate_devices(self):
         self.device_combo.clear()
@@ -743,8 +876,13 @@ class RemapGUI(QWidget):
             return MOUSE_ALIASES.get(label, [fallback_code])
         return KEY_ALIASES.get(label, [fallback_code])
 
-    def _filter_paths_for_mappings(self, paths: List[str]) -> List[str]:
-        mapped_codes = extract_mapped_codes(self.mappings)
+    def _filter_paths_for_mappings(
+        self,
+        paths: List[str],
+        mappings: Dict[str, Action] | None = None,
+    ) -> List[str]:
+        mapping_source = mappings if mappings is not None else self.mappings
+        mapped_codes = extract_mapped_codes(mapping_source)
         if not mapped_codes:
             return paths
 
@@ -764,7 +902,9 @@ class RemapGUI(QWidget):
 
     def closeEvent(self, event):
         self._stop_capture()
-        self._stop()
+        if self.service_thread and self.service_thread.is_alive():
+            self.service_thread.join(timeout=0.2)
+        self._stop_sync()
         super().closeEvent(event)
 
 
@@ -783,7 +923,14 @@ def launch():
     if not verbose_input:
         logger.info("Mapper input logs em modo reduzido (set SYNAPSE_VERBOSE_INPUT=1 para debug).")
     app = QApplication.instance() or QApplication([])
-    gui = RemapGUI()
+    app_icon = build_app_icon()
+    app.setWindowIcon(app_icon)
+    app.setApplicationName("synapse-like")
+    app.setApplicationDisplayName("Synapse-Like")
+    if hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName("synapse-like")
+
+    gui = RemapGUI(app_icon=app_icon)
     gui.show()
     app.exec()
 

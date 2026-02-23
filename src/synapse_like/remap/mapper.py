@@ -107,7 +107,7 @@ class InputMapper:
                 pass
             self._src = None
         if self._thread:
-            self._thread.join(timeout=1)
+            self._thread.join(timeout=0.2)
             self._thread = None
         if self._sink:
             self._sink.close()
