@@ -12,6 +12,11 @@
 poetry install
 ```
 
+## Installer scripts (user install)
+- Install: `./scripts/install_linux.sh`
+- Uninstall: `./scripts/uninstall_linux.sh`
+- Build release tarball: `./scripts/build_release.sh`
+
 ## Run checks
 ```bash
 poetry run synapse devices

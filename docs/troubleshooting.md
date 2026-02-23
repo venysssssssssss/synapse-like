@@ -18,3 +18,25 @@
 - Confirm the capability exists via `synapse capabilities 0`.
 - Not all devices expose DPI/polling; lighting modes vary. OpenRazer may require specific effect names per device.
 - Check logs: run CLI with `RUST_LOG=debug` (if you add logging) or watch `journalctl --user -u openrazer-daemon`.
+
+## GUI abre com erro Qt xcb plugin
+- Instale dependencias Qt/XCB:
+  - Debian/Ubuntu/Kali: `sudo apt install libxcb-cursor0`
+
+## Permission denied em /dev/input/by-id ou /dev/uinput
+- Aplique ACL temporaria:
+  - `sudo setfacl -m u:$USER:rw /dev/input/by-id/*Razer*event* /dev/uinput`
+- Para persistencia, configure regra `udev`.
+
+## Icone nao aparece no dock/menu
+- Reinstale desktop entry e icone:
+  - `./scripts/install_linux.sh`
+- Reinicie shell do desktop ou logout/login.
+- Em GNOME, limpe cache de apps se necessario:
+  - `update-desktop-database ~/.local/share/applications`
+
+## Launcher nao encontrado
+- Confirme `~/.local/bin` no PATH:
+  - `echo $PATH`
+- Se faltar, adicione no `~/.bashrc`:
+  - `export PATH="$HOME/.local/bin:$PATH"`

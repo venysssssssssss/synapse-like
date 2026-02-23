@@ -1,56 +1,81 @@
-# Synapse-Like for Linux (Open Source)
+# Synapse-Like for Linux
 
-**Target (verified via `lsusb`)**
-- Keyboard: `1532:011a` — Razer BlackWidow Ultimate 2013
-- Mouse: `1532:0016` — Razer DeathAdder 3.5G (RZ01-0015)
+Open-source alternativa ao Razer Synapse para Linux, com foco em remap de teclas/botoes, perfis locais e base para integracao OpenRazer.
 
-## 1) Objective
-Build an open-source "Synapse-like" for Linux, reimplementing the experience (profiles, configs, lighting, DPI/polling) using **OpenRazer** as a base (driver + daemon), with a scalable and testable architecture.
+## Status atual
 
-## 2) Scope
+- GUI de remap funcional (teclado + mouse)
+- suporte a M-keys (M1/M2 confirmados como F13/F14 em BlackWidow Ultimate)
+- perfis de mapping em JSON
+- modo de baixa latencia para remap de scroll/botoes auxiliares
+- detecao automatica de paths Razer em `/dev/input/by-id`
 
-### MVP (First Usable Delivery)
-- Detect devices and display **capabilities**
-- Apply basic configurations:
-  - Lighting (when supported by device/driver)
-  - DPI / polling rate (when exposed)
-- **Local Profiles**: create/save/load/apply
-- CLI for debug + simple automation
-- Diagnostic bundle (IDs, capabilities, logs)
+## Instalacao (Linux)
 
-## 3) Architecture
+### Opcao A: instalacao local (recomendada)
 
-1.  **Adapter (OpenRazer)**: Interface with hardware.
-2.  **Core (Hardware Agnostic)**: Models for Device, Capabilities, Profile.
-3.  **Service**: User-level daemon (M2).
-4.  **UI**: CLI (M1), GUI (M2).
-
-## 4) Stack
-- **Language**: Python 3.12+
-- **Dependency Management**: Poetry
-- **CLI**: Typer
-- **GUI**: PySide6 (planned for M2)
-- **Driver Interface**: OpenRazer
-
-## Quick start (MVP)
 ```bash
-poetry install
-poetry run synapse devices          # list connected devices
-poetry run synapse capabilities 0   # show capabilities of first device
-poetry run synapse apply <profile>  # apply saved profile (see docs)
-poetry run synapse gui              # launch remap GUI (auto-detects Razer input paths)
+./scripts/install_linux.sh
 ```
 
-More details in `docs/dev-setup.md` and `docs/troubleshooting.md`.
+Com dependencias de sistema via apt:
 
-### Remap GUI (experimental)
-- Needs access to `/dev/input/*` and `/dev/uinput` (run as root or add udev rules).
-- Razer devices are auto-listed from `/dev/input/by-id/*Razer*`; pick keyboard or mouse from the dropdown or type a custom path.
-- Click keys (including M1-M5 and numpad) or mouse buttons (LMB/MMB/RMB/M4/M5), set actions (keystroke, scroll, side buttons), save/load mappings, and click **Aplicar** to start the uinput remapper.
-- `Mapear M-X (escutar)` calibrates `M5 -> M4 -> M3 -> M2 -> M1` quickly.
-- `Mapear teclado completo (ID)` captures every key in sequence and stores exact event IDs (symbolic + numeric) per key slot for precise remap.
-- Scroll remaps emit through a dedicated virtual pointer and matching supports both `EV_KEY` and `MSC_SCAN` IDs (example: `70068`, `70069`).
+```bash
+./scripts/install_linux.sh --with-system-deps
+```
 
-## Usage
-(Instructions to be added)
-# synapse-like
+Documentacao completa: `docs/install-linux.md`
+
+### Opcao B: modo dev com Poetry
+
+```bash
+poetry install
+poetry run synapse gui
+```
+
+## Execucao
+
+Depois de instalado:
+
+```bash
+~/.local/bin/synapse-like
+```
+
+ou abra pelo menu do sistema: **Synapse-Like**
+
+## Comandos CLI
+
+```bash
+poetry run synapse devices
+poetry run synapse capabilities 0
+poetry run synapse apply <profile>
+poetry run synapse gui
+```
+
+## Permissoes (importante para remap)
+
+Para ler `event*` e escrever em `uinput`:
+
+```bash
+sudo setfacl -m u:$USER:rw /dev/input/by-id/*Razer*event* /dev/uinput
+```
+
+## Estrutura principal
+
+- `src/synapse_like/gui/` - interface e fluxo de remap
+- `src/synapse_like/remap/` - engine uinput/evdev
+- `src/synapse_like/adapters/openrazer/` - adapter OpenRazer
+- `scripts/install_linux.sh` - instalador Linux
+- `scripts/uninstall_linux.sh` - desinstalador
+- `scripts/build_release.sh` - gera pacote para release
+
+## Download no GitHub Releases
+
+Este repo inclui workflow para publicar artefatos de download em tags `v*`.
+
+- Workflow: `.github/workflows/release.yml`
+- Guia de release: `docs/release-github.md`
+
+## Troubleshooting
+
+Veja `docs/troubleshooting.md`.
