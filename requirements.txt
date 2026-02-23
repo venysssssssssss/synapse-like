@@ -1,0 +1,7 @@
+typer>=0.9.0
+rich>=13.7.0
+pydantic>=2.6.0
+pyside6>=6.6.0
+evdev>=1.7.1
+# openrazer is a system package, usually installed via apt or pip system-wide
+# If not, try installing python3-openrazer

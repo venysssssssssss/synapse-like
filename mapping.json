@@ -1,0 +1,70 @@
+{
+  "version": 2,
+  "device_path": "/dev/input/by-id/usb-Razer_Razer_BlackWidow_Ultimate-event-kbd",
+  "mappings": {
+    "KEY_MACRO1": {
+      "type": "scroll_up",
+      "payload": {}
+    },
+    "KEY_F13": {
+      "type": "scroll_up",
+      "payload": {}
+    },
+    "183": {
+      "type": "scroll_up",
+      "payload": {}
+    },
+    "MSC_SCAN:70068": {
+      "type": "scroll_up",
+      "payload": {}
+    },
+    "MSC_SCAN_HEX:70068": {
+      "type": "scroll_up",
+      "payload": {}
+    },
+    "KEY_MACRO2": {
+      "type": "scroll_down",
+      "payload": {}
+    },
+    "KEY_F14": {
+      "type": "scroll_down",
+      "payload": {}
+    },
+    "184": {
+      "type": "scroll_down",
+      "payload": {}
+    },
+    "MSC_SCAN:70069": {
+      "type": "scroll_down",
+      "payload": {}
+    },
+    "MSC_SCAN_HEX:70069": {
+      "type": "scroll_down",
+      "payload": {}
+    }
+  },
+  "dynamic_aliases": {
+    "M1": [
+      "KEY_F13",
+      "183",
+      "KEY_MACRO1"
+    ],
+    "M2": [
+      "KEY_F14",
+      "184",
+      "KEY_MACRO2"
+    ]
+  },
+  "key_id_map": {
+    "M1": {
+      "symbolic": "KEY_F13",
+      "numeric": "183",
+      "scan": "70068"
+    },
+    "M2": {
+      "symbolic": "KEY_F14",
+      "numeric": "184",
+      "scan": "70069"
+    }
+  }
+}
