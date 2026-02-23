@@ -46,6 +46,7 @@ from synapse_like.gui.theme import STYLE_SHEET
 from synapse_like.gui.utils import event_code_name
 from synapse_like.remap.actions import Action, ActionType
 from synapse_like.remap.mapper import InputMapper, MappingConfig
+from synapse_like.remap.strategy import extract_mapped_codes, is_aux_pointer_only_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -155,37 +156,68 @@ class RemapGUI(QWidget):
     def _build_left_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("leftPanel")
-        panel.setMinimumWidth(300)
-        layout = QVBoxLayout()
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        panel.setMinimumWidth(320)
+        
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(16)
 
-        layout.addWidget(QLabel("SELECIONAR PERFIL"))
+        # --- Profiles Card ---
+        profile_card = QFrame()
+        profile_card.setProperty("class", "card")
+        p_layout = QVBoxLayout()
+        p_layout.setContentsMargins(16, 16, 16, 16)
+        p_layout.setSpacing(10)
+        
+        lbl_profile = QLabel("PERFIL")
+        lbl_profile.setProperty("class", "cardTitle")
+        p_layout.addWidget(lbl_profile)
+
         self.profile_combo = QComboBox()
-        self.profile_combo.addItems(["default", "work", "gaming"])
-        layout.addWidget(self.profile_combo)
+        self.profile_combo.addItems(["Default", "Work", "Gaming"])
+        p_layout.addWidget(self.profile_combo)
 
         profile_actions = QHBoxLayout()
-        for text in ["+", "x", "..."]:
-            button = QPushButton(text)
-            button.setFixedHeight(28)
-            profile_actions.addWidget(button)
-        layout.addLayout(profile_actions)
+        profile_actions.setSpacing(8)
+        for text in ["+", "Rename", "Delete"]:
+            btn = QPushButton(text)
+            btn.setProperty("class", "iconBtn")
+            profile_actions.addWidget(btn)
+        p_layout.addLayout(profile_actions)
 
-        layout.addWidget(QLabel("NOME DE PERFIL"))
-        self.profile_name = QLineEdit("default")
-        layout.addWidget(self.profile_name)
+        lbl_name = QLabel("NOME DO PERFIL")
+        lbl_name.setProperty("class", "fieldLabel")
+        p_layout.addWidget(lbl_name)
+        
+        self.profile_name = QLineEdit("Default")
+        p_layout.addWidget(self.profile_name)
 
-        layout.addWidget(QLabel("ATALHO"))
+        # Shortcuts section in profile card
+        lbl_shortcut = QLabel("ATALHO DE TROCA")
+        lbl_shortcut.setProperty("class", "fieldLabel")
+        p_layout.addWidget(lbl_shortcut)
+        
         self.shortcut_combo = QComboBox()
-        self.shortcut_combo.addItems(["FN+1", "FN+2", "FN+3"])
-        layout.addWidget(self.shortcut_combo)
+        self.shortcut_combo.addItems(["FN + 1", "FN + 2", "FN + 3", "None"])
+        p_layout.addWidget(self.shortcut_combo)
 
         self.link_program_cb = QCheckBox("Vincular programa")
-        layout.addWidget(self.link_program_cb)
+        p_layout.addWidget(self.link_program_cb)
+        
+        profile_card.setLayout(p_layout)
+        main_layout.addWidget(profile_card)
 
-        layout.addSpacing(6)
-        layout.addWidget(QLabel("DEVICE PATH"))
+        # --- Device / Actions Card ---
+        action_card = QFrame()
+        action_card.setProperty("class", "card")
+        a_layout = QVBoxLayout()
+        a_layout.setContentsMargins(16, 16, 16, 16)
+        a_layout.setSpacing(10)
+
+        lbl_device = QLabel("DEVICE PATH")
+        lbl_device.setProperty("class", "cardTitle")
+        a_layout.addWidget(lbl_device)
+
         device_row = QHBoxLayout()
         self.device_combo = QComboBox()
         self.device_combo.currentIndexChanged.connect(self._combo_to_input)
@@ -193,15 +225,21 @@ class RemapGUI(QWidget):
         self.device_input.setPlaceholderText("/dev/input/by-id/...")
         device_row.addWidget(self.device_combo, 1)
         device_row.addWidget(self.device_input, 2)
-        layout.addLayout(device_row)
+        a_layout.addLayout(device_row)
 
-        layout.addSpacing(10)
+        a_layout.addSpacing(10)
+        lbl_actions = QLabel("ACOES")
+        lbl_actions.setProperty("class", "cardTitle")
+        a_layout.addWidget(lbl_actions)
+
         self.learn_mx_btn = QPushButton("Mapear M-X (escutar)")
-        self.learn_all_btn = QPushButton("Mapear teclado completo (ID)")
-        self.save_btn = QPushButton("Salvar mapping")
-        self.load_btn = QPushButton("Carregar mapping")
-        self.apply_btn = QPushButton("Aplicar (uinput)")
-        self.stop_btn = QPushButton("Parar")
+        self.learn_all_btn = QPushButton("Mapear teclado completo")
+        self.save_btn = QPushButton("Salvar Profile")
+        self.load_btn = QPushButton("Carregar Profile")
+        self.apply_btn = QPushButton("APLICAR NO SYSTEMA")
+        self.apply_btn.setProperty("class", "primaryBtn")
+        self.stop_btn = QPushButton("Parar Servico")
+        self.stop_btn.setProperty("class", "dangerBtn")
 
         self.learn_mx_btn.clicked.connect(self._toggle_mx_capture)
         self.learn_all_btn.clicked.connect(self._toggle_full_capture)
@@ -210,23 +248,25 @@ class RemapGUI(QWidget):
         self.apply_btn.clicked.connect(self._apply)
         self.stop_btn.clicked.connect(self._stop)
 
-        for button in [
-            self.learn_mx_btn,
-            self.learn_all_btn,
-            self.save_btn,
-            self.load_btn,
-            self.apply_btn,
-            self.stop_btn,
-        ]:
-            layout.addWidget(button)
+        for btn in [self.learn_mx_btn, self.learn_all_btn, self.save_btn, self.load_btn]:
+            btn.setProperty("class", "secondaryBtn")
+            a_layout.addWidget(btn)
+        
+        a_layout.addSpacing(10)
+        a_layout.addWidget(self.apply_btn)
+        a_layout.addWidget(self.stop_btn)
 
-        layout.addSpacing(8)
+        action_card.setLayout(a_layout)
+        main_layout.addWidget(action_card)
+
+        # Status at bottom
         self.status_label = QLabel("Pronto.")
         self.status_label.setWordWrap(True)
         self.status_label.setObjectName("statusLabel")
-        layout.addWidget(self.status_label)
-        layout.addStretch(1)
-        panel.setLayout(layout)
+        main_layout.addWidget(self.status_label)
+        
+        main_layout.addStretch(1)
+        panel.setLayout(main_layout)
         return panel
 
     def _build_keyboard_page(self) -> QWidget:
@@ -615,12 +655,23 @@ class RemapGUI(QWidget):
             QMessageBox.warning(self, "Device", "Nenhum device de evento foi encontrado.")
             return
 
+        paths = self._filter_paths_for_mappings(paths)
+        low_latency = is_aux_pointer_only_mapping(self.mappings)
         failures = []
         logger.info("Applying mapper with %d mapping entries", len(self.mappings))
         logger.info("Mapper paths: %s", ", ".join(paths))
+        logger.info("Low-latency mode: %s", "enabled" if low_latency else "disabled")
         for path in paths:
             try:
-                mapper = InputMapper(MappingConfig(device_path=path, mappings=self.mappings))
+                use_fast_mode = low_latency and "-if" in path
+                mapper = InputMapper(
+                    MappingConfig(
+                        device_path=path,
+                        mappings=self.mappings,
+                        grab=not use_fast_mode,
+                        passthrough=not use_fast_mode,
+                    )
+                )
                 mapper.start()
                 self.mappers.append(mapper)
             except Exception as exc:  # noqa: BLE001
@@ -631,7 +682,10 @@ class RemapGUI(QWidget):
             return
         if failures:
             QMessageBox.warning(self, "Aviso", "Interfaces nao iniciaram:\n" + "\n".join(failures))
-        self.status_label.setText(f"Remapper ativo em {len(self.mappers)} interface(s).")
+        mode_text = " (modo baixa latencia)" if low_latency else ""
+        self.status_label.setText(
+            f"Remapper ativo em {len(self.mappers)} interface(s).{mode_text}"
+        )
 
     def _stop(self):
         if not self.mappers:
@@ -688,6 +742,25 @@ class RemapGUI(QWidget):
         if fallback_code.startswith("BTN_"):
             return MOUSE_ALIASES.get(label, [fallback_code])
         return KEY_ALIASES.get(label, [fallback_code])
+
+    def _filter_paths_for_mappings(self, paths: List[str]) -> List[str]:
+        mapped_codes = extract_mapped_codes(self.mappings)
+        if not mapped_codes:
+            return paths
+
+        selected: List[str] = []
+        for path in paths:
+            try:
+                device = InputDevice(path)
+                supported = set(device.capabilities(absinfo=False).get(ecodes.EV_KEY, []))
+                device.close()
+                if supported & mapped_codes:
+                    selected.append(path)
+            except Exception:  # noqa: BLE001
+                # If device cannot be inspected (permissions), keep it for runtime attempt.
+                selected.append(path)
+
+        return selected or paths
 
     def closeEvent(self, event):
         self._stop_capture()

@@ -15,11 +15,15 @@ logger = logging.getLogger(__name__)
 class MappingConfig:
     device_path: str
     mappings: Dict[str, Action] = field(default_factory=dict)  # physical key -> Action
+    grab: bool = True
+    passthrough: bool = True
 
     def to_dict(self):
         return {
             "device_path": self.device_path,
             "mappings": {k: v.to_dict() for k, v in self.mappings.items()},
+            "grab": self.grab,
+            "passthrough": self.passthrough,
         }
 
     @classmethod
@@ -27,6 +31,8 @@ class MappingConfig:
         return cls(
             device_path=data["device_path"],
             mappings={k: Action.from_dict(v) for k, v in data.get("mappings", {}).items()},
+            grab=bool(data.get("grab", True)),
+            passthrough=bool(data.get("passthrough", True)),
         )
 
     def save(self, path):
@@ -54,6 +60,7 @@ class InputMapper:
         self._sink: UInput | None = None
         self._pointer_sink: UInput | None = None
         self._name_cache: Dict[int, str] = {}
+        self._grabbed = False
 
     def start(self):
         if self._running:
@@ -61,20 +68,24 @@ class InputMapper:
         logger.info("Starting mapper for %s", self.config.device_path)
         # Initialize source and uinput synchronously so errors are visible to GUI.
         self._src = InputDevice(self.config.device_path)
-        self._src.grab()
+        if self.config.grab:
+            self._src.grab()
+            self._grabbed = True
 
         raw_caps = self._src.capabilities(absinfo=False)
-        capabilities = self._build_caps(raw_caps)
-        self._sink = UInput(
-            capabilities,
-            name=f"{self._src.name} (synapse-like)",
-            bustype=self._src.info.bustype,
-        )
-        self._pointer_sink = UInput(
-            self._pointer_caps(),
-            name=f"{self._src.name} (synapse-like pointer)",
-            bustype=self._src.info.bustype,
-        )
+        if self.config.passthrough or self._needs_keystroke_output():
+            capabilities = self._build_caps(raw_caps)
+            self._sink = UInput(
+                capabilities,
+                name=f"{self._src.name} (synapse-like)",
+                bustype=self._src.info.bustype,
+            )
+        if self._needs_pointer_output():
+            self._pointer_sink = UInput(
+                self._pointer_caps(),
+                name=f"{self._src.name} (synapse-like pointer)",
+                bustype=self._src.info.bustype,
+            )
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -84,10 +95,12 @@ class InputMapper:
     def stop(self):
         self._running = False
         if self._src:
-            try:
-                self._src.ungrab()
-            except Exception:
-                pass
+            if self._grabbed:
+                try:
+                    self._src.ungrab()
+                except Exception:
+                    pass
+                self._grabbed = False
             try:
                 self._src.close()
             except Exception:
@@ -146,7 +159,8 @@ class InputMapper:
                         continue
 
                 # Default passthrough
-                sink.write_event(event)
+                if sink is not None and self.config.passthrough:
+                    sink.write_event(event)
         except OSError as exc:
             if self._running:
                 logger.warning("Mapper loop error on %s: %s", self.config.device_path, exc)
@@ -205,8 +219,15 @@ class InputMapper:
             if target:
                 code = ecodes.ecodes.get(target)
                 if code:
-                    self._sink.write(ecodes.EV_KEY, code, event.value)
-                    self._sink.syn()
+                    sink = self._sink
+                    if sink is None:
+                        logger.warning(
+                            "[%s] no keyboard sink for keystroke emission",
+                            self.config.device_path,
+                        )
+                        return
+                    sink.write(ecodes.EV_KEY, code, event.value)
+                    sink.syn()
                     if event.value == 1:
                         logger.debug(
                             "[%s] emitted keystroke: %s",
@@ -222,23 +243,27 @@ class InputMapper:
 
         if action.type == ActionType.SCROLL_UP:
             sink = self._pointer_sink or self._sink
+            if sink is None:
+                return
             sink.write(ecodes.EV_REL, ecodes.REL_WHEEL, 1)
-            if hasattr(ecodes, "REL_WHEEL_HI_RES"):
-                sink.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, 120)
             logger.debug("[%s] emitted scroll up", self.config.device_path)
         elif action.type == ActionType.SCROLL_DOWN:
             sink = self._pointer_sink or self._sink
+            if sink is None:
+                return
             sink.write(ecodes.EV_REL, ecodes.REL_WHEEL, -1)
-            if hasattr(ecodes, "REL_WHEEL_HI_RES"):
-                sink.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, -120)
             logger.debug("[%s] emitted scroll down", self.config.device_path)
         elif action.type == ActionType.MOUSE_BUTTON_X1:
             sink = self._pointer_sink or self._sink
+            if sink is None:
+                return
             sink.write(ecodes.EV_KEY, ecodes.BTN_SIDE, 1)
             sink.write(ecodes.EV_KEY, ecodes.BTN_SIDE, 0)
             logger.debug("[%s] emitted mouse button X1", self.config.device_path)
         elif action.type == ActionType.MOUSE_BUTTON_X2:
             sink = self._pointer_sink or self._sink
+            if sink is None:
+                return
             sink.write(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1)
             sink.write(ecodes.EV_KEY, ecodes.BTN_EXTRA, 0)
             logger.debug("[%s] emitted mouse button X2", self.config.device_path)
@@ -277,9 +302,24 @@ class InputMapper:
 
     def _pointer_caps(self):
         rels = [ecodes.REL_WHEEL, ecodes.REL_X, ecodes.REL_Y]
-        if hasattr(ecodes, "REL_WHEEL_HI_RES"):
-            rels.append(ecodes.REL_WHEEL_HI_RES)
         return {
             ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE, ecodes.BTN_SIDE, ecodes.BTN_EXTRA],
             ecodes.EV_REL: rels,
         }
+
+    def _needs_pointer_output(self) -> bool:
+        for action in self.config.mappings.values():
+            if action.type in {
+                ActionType.SCROLL_UP,
+                ActionType.SCROLL_DOWN,
+                ActionType.MOUSE_BUTTON_X1,
+                ActionType.MOUSE_BUTTON_X2,
+            }:
+                return True
+        return False
+
+    def _needs_keystroke_output(self) -> bool:
+        for action in self.config.mappings.values():
+            if action.type == ActionType.KEYSTROKE:
+                return True
+        return False

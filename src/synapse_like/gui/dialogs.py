@@ -6,9 +6,11 @@ from synapse_like.remap.actions import Action, ActionType
 class ActionDialog(QDialog):
     def __init__(self, key_label: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Atribuir acao: {key_label}")
+        self.setWindowTitle(f"Atribuir Acao: {key_label}")
+        self.setMinimumWidth(300)
 
         layout = QVBoxLayout()
+        layout.setSpacing(12)
 
         self.combo = QComboBox()
         self.combo.addItems(
@@ -28,15 +30,23 @@ class ActionDialog(QDialog):
         self.key_input.setVisible(False)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         ok = QPushButton("OK")
+        ok.setProperty("class", "primaryBtn")
+        
         cancel = QPushButton("Cancelar")
+        cancel.setProperty("class", "secondaryBtn")
+        
         ok.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
-        buttons.addWidget(ok)
+        
+        buttons.addStretch(1)
         buttons.addWidget(cancel)
+        buttons.addWidget(ok)
 
         layout.addWidget(self.combo)
         layout.addWidget(self.key_input)
+        layout.addSpacing(8)
         layout.addLayout(buttons)
         self.setLayout(layout)
 
