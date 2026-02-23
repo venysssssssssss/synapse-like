@@ -75,6 +75,8 @@ Este repo inclui workflow para publicar artefatos de download em tags `v*`.
 
 - Workflow: `.github/workflows/release.yml`
 - Guia de release: `docs/release-github.md`
+- Arquivo executavel unico (Linux): `synapse-like-<versao>-linux-x86_64`
+- Pacote fonte: `synapse-like-<versao>-linux.tar.gz`
 
 ## Troubleshooting
 

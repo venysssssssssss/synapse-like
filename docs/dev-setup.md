@@ -16,6 +16,7 @@ poetry install
 - Install: `./scripts/install_linux.sh`
 - Uninstall: `./scripts/uninstall_linux.sh`
 - Build release tarball: `./scripts/build_release.sh`
+- Build single executable: `./scripts/build_executable.sh`
 
 ## Run checks
 ```bash

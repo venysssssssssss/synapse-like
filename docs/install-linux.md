@@ -36,7 +36,18 @@ Com dependencias de sistema via apt:
 
 ## 3) Instalacao a partir de release (download)
 
-Depois de baixar o arquivo `synapse-like-<versao>-linux.tar.gz` da aba **Releases**:
+Opcao 1 (recomendada): arquivo executavel unico.
+
+Depois de baixar `synapse-like-<versao>-linux-x86_64` da aba **Releases**:
+
+```bash
+chmod +x synapse-like-<versao>-linux-x86_64
+./synapse-like-<versao>-linux-x86_64
+```
+
+Opcao 2: pacote fonte com instalador.
+
+Depois de baixar `synapse-like-<versao>-linux.tar.gz`:
 
 ```bash
 tar -xzf synapse-like-<versao>-linux.tar.gz

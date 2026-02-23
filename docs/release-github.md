@@ -6,7 +6,10 @@ Este fluxo deixa o download disponivel direto no repositorio.
 
 - Workflow: `.github/workflows/release.yml`
 - Build de pacote Linux: `scripts/build_release.sh`
+- Build de executavel unico: `scripts/build_executable.sh`
 - Assets publicados automaticamente:
+  - `dist/synapse-like-<versao>-linux-x86_64`
+  - `dist/synapse-like-<versao>-linux-x86_64.sha256`
   - `dist/synapse-like-<versao>-linux.tar.gz`
   - `dist/synapse-like-<versao>-linux.tar.gz.sha256`
 
@@ -40,6 +43,7 @@ Quando a tag `v*` for enviada:
 Depois de baixar os arquivos:
 
 ```bash
+sha256sum -c synapse-like-<versao>-linux-x86_64.sha256
 sha256sum -c synapse-like-<versao>-linux.tar.gz.sha256
 ```
 
@@ -49,6 +53,7 @@ Deve retornar `OK`.
 
 ```bash
 ./scripts/build_release.sh
+./scripts/build_executable.sh
 ```
 
 Arquivos serao gerados em `dist/`.
