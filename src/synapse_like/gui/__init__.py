@@ -1,3 +1,3 @@
-from synapse_like.gui.remap_gui import launch
+from synapse_like.gui.remap_gui import RemapGUI, launch
 
-__all__ = ["launch"]
+__all__ = ["RemapGUI", "launch"]

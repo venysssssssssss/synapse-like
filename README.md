@@ -9,6 +9,11 @@ Open-source alternativa ao Razer Synapse para Linux, com foco em remap de teclas
 - perfis de mapping em JSON
 - modo de baixa latencia para remap de scroll/botoes auxiliares
 - detecao automatica de paths Razer em `/dev/input/by-id`
+- daemon de remap separado da GUI
+- auto-switch de perfis por `WM_CLASS`
+- system tray com troca rapida de perfil
+- editor de macros em timeline com gravacao
+- persistencia onboard best-effort via OpenRazer
 
 ## Instalacao (Linux)
 

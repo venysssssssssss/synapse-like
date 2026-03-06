@@ -1,72 +1,89 @@
+from __future__ import annotations
+
 import json
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Iterable, Optional
 
 from evdev import InputDevice, UInput, ecodes
 
-from synapse_like.remap.actions import Action, ActionType
+from synapse_like.remap.actions import Action
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class MappingConfig:
     device_path: str
-    mappings: Dict[str, Action] = field(default_factory=dict)  # physical key -> Action
+    mappings: Dict[str, Action] = field(default_factory=dict)
     grab: bool = True
     passthrough: bool = True
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, object]:
         return {
             "device_path": self.device_path,
-            "mappings": {k: v.to_dict() for k, v in self.mappings.items()},
+            "mappings": {key: action.to_dict() for key, action in self.mappings.items()},
             "grab": self.grab,
             "passthrough": self.passthrough,
         }
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data: Dict[str, object]) -> "MappingConfig":
+        raw_mappings = data.get("mappings", {})
         return cls(
-            device_path=data["device_path"],
-            mappings={k: Action.from_dict(v) for k, v in data.get("mappings", {}).items()},
+            device_path=str(data["device_path"]),
+            mappings={
+                str(key): Action.from_dict(value)
+                for key, value in raw_mappings.items()
+                if isinstance(value, dict)
+            }
+            if isinstance(raw_mappings, dict)
+            else {},
             grab=bool(data.get("grab", True)),
             passthrough=bool(data.get("passthrough", True)),
         )
 
-    def save(self, path):
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+    def save(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, indent=2)
 
     @classmethod
-    def load(cls, path):
-        with open(path) as f:
-            return cls.from_dict(json.load(f))
+    def load(cls, path: str) -> "MappingConfig":
+        with open(path, encoding="utf-8") as handle:
+            return cls.from_dict(json.load(handle))
 
 
 class InputMapper:
     """
-    Simple user-space remapper: grabs an input device, emits to a uinput
-    virtual device applying the configured actions.
-    Requires read/write access to /dev/input and uinput.
+    User-space remapper that translates events from a source device to one or two
+    virtual uinput devices.
     """
 
     def __init__(self, config: MappingConfig):
         self.config = config
         self._running = False
-        self._thread: threading.Thread | None = None
-        self._src: InputDevice | None = None
-        self._sink: UInput | None = None
-        self._pointer_sink: UInput | None = None
-        self._name_cache: Dict[int, str] = {}
+        self._thread: Optional[threading.Thread] = None
+        self._src: Optional[InputDevice] = None
+        self._sink: Optional[UInput] = None
+        self._pointer_sink: Optional[UInput] = None
         self._grabbed = False
+        self._fast_code_map: Dict[int, Action] = {}
+        self._fast_scan_map: Dict[int, Action] = {}
+        self._name_cache: Dict[int, str] = {}
+        self._debug_enabled = False
+        self.active_keys: set[str] = set()
+        self._build_fast_lookups()
 
-    def start(self):
+    @property
+    def device_path(self) -> str:
+        return self.config.device_path
+
+    def start(self) -> None:
         if self._running:
             return
+
         logger.info("Starting mapper for %s", self.config.device_path)
-        # Initialize source and uinput synchronously so errors are visible to GUI.
         self._src = InputDevice(self.config.device_path)
         if self.config.grab:
             self._src.grab()
@@ -74,9 +91,8 @@ class InputMapper:
 
         raw_caps = self._src.capabilities(absinfo=False)
         if self.config.passthrough or self._needs_keystroke_output():
-            capabilities = self._build_caps(raw_caps)
             self._sink = UInput(
-                capabilities,
+                self._build_caps(raw_caps),
                 name=f"{self._src.name} (synapse-like)",
                 bustype=self._src.info.bustype,
             )
@@ -87,13 +103,16 @@ class InputMapper:
                 bustype=self._src.info.bustype,
             )
 
+        self._build_fast_lookups()
+        self._debug_enabled = logger.isEnabledFor(logging.DEBUG)
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         logger.info("Mapper active for %s", self.config.device_path)
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
+
         if self._src:
             if self._grabbed:
                 try:
@@ -105,60 +124,86 @@ class InputMapper:
                 self._src.close()
             except Exception:
                 pass
-            self._src = None
+
         if self._thread:
-            self._thread.join(timeout=0.2)
+            self._thread.join(timeout=0.3)
             self._thread = None
+
         if self._sink:
             self._sink.close()
-            self._sink = None
         if self._pointer_sink:
             self._pointer_sink.close()
-            self._pointer_sink = None
+
+        self._src = None
+        self._sink = None
+        self._pointer_sink = None
+        self.active_keys.clear()
         logger.info("Mapper stopped for %s", self.config.device_path)
 
-    # Internal helpers
-    def _loop(self):
-        pending_scan: int | None = None
+    def _build_fast_lookups(self) -> None:
+        self._fast_code_map.clear()
+        self._fast_scan_map.clear()
+
+        for key, action in self.config.mappings.items():
+            if key.startswith("MSC_SCAN:"):
+                try:
+                    self._fast_scan_map[int(key.split(":", 1)[1])] = action
+                    continue
+                except ValueError:
+                    continue
+
+            if key.startswith("MSC_SCAN_HEX:"):
+                try:
+                    self._fast_scan_map[int(key.split(":", 1)[1], 16)] = action
+                    continue
+                except ValueError:
+                    continue
+
+            code = ecodes.ecodes.get(key)
+            if code is None and key.isdigit():
+                code = int(key)
+
+            if code is not None:
+                self._fast_code_map[code] = action
+
+    def _loop(self) -> None:
+        if self._src is None:
+            return
+
+        pending_scan: Optional[int] = None
         sink = self._sink
+        debug_enabled = self._debug_enabled
+
         try:
             for event in self._src.read_loop():
                 if not self._running:
                     break
+
                 if event.type == ecodes.EV_MSC and event.code == ecodes.MSC_SCAN:
                     pending_scan = int(event.value)
-                    logger.debug(
-                        "[%s] msc scan: dec=%s hex=%s",
-                        self.config.device_path,
-                        pending_scan,
-                        format(pending_scan, "x"),
-                    )
                     continue
+
                 if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
                     pending_scan = None
+
                 if event.type == ecodes.EV_KEY:
-                    code_str = self._code_name(event.code)
-                    if event.value == 1:
-                        logger.debug(
-                            "[%s] key down: code=%s (%s)",
-                            self.config.device_path,
-                            event.code,
-                            code_str,
-                        )
-                    mapping = self._resolve_mapping(code_str, event.code, pending_scan)
-                    if mapping:
-                        if event.value == 1:
+                    mapping = self._resolve_mapping(
+                        self._code_name(event.code),
+                        event.code,
+                        pending_scan,
+                    )
+                    self._update_active_keys(event.code, event.value)
+                    if mapping is not None:
+                        if debug_enabled and event.value == 1:
                             logger.debug(
-                                "[%s] mapping hit: %s/%s -> %s",
+                                "[%s] mapping hit: code=%s -> %s",
                                 self.config.device_path,
-                                code_str,
                                 event.code,
-                                mapping.type.value,
+                                mapping.type_name,
                             )
-                        self._handle_action(mapping, event)
+                        self._handle_action(mapping, event.value)
                         continue
 
-                # Default passthrough
                 if sink is not None and self.config.passthrough:
                     sink.write_event(event)
         except OSError as exc:
@@ -169,157 +214,82 @@ class InputMapper:
         finally:
             self._running = False
 
-    def _resolve_mapping(self, code_name: str, code_num: int, scan: int | None) -> Action | None:
-        candidates = [code_name, str(code_num)]
-        if scan is not None:
-            scan_hex = format(scan, "x")
-            candidates.extend(
-                [
-                    f"MSC_SCAN:{scan}",
-                    f"MSC_SCAN:{scan_hex}",
-                    f"MSC_SCAN:0x{scan_hex}",
-                    f"MSC_SCAN_HEX:{scan_hex}",
-                    scan_hex,
-                ]
-            )
-        for key in candidates:
-            action = self.config.mappings.get(key)
-            if action:
-                return action
-        return None
+    def _resolve_mapping(
+        self,
+        key_name: str,
+        numeric_code: int,
+        scan_code: Optional[int],
+    ) -> Optional[Action]:
+        if scan_code is not None:
+            mapped = self._fast_scan_map.get(scan_code)
+            if mapped is not None:
+                return mapped
+
+        mapped = self._fast_code_map.get(numeric_code)
+        if mapped is not None:
+            return mapped
+
+        return self.config.mappings.get(key_name)
+
+    def _handle_action(self, action: Action, event_value: int) -> None:
+        sink = self._pointer_sink if action.strategy.prefers_pointer_output() else self._sink
+        if sink is None:
+            sink = self._sink or self._pointer_sink
+        if sink is None:
+            return
+        action.strategy.execute(sink, event_value, action.strategy.to_dict())
+
+    def _update_active_keys(self, code: int, value: int) -> None:
+        name = self._code_name(code)
+        if value == 1:
+            self.active_keys.add(name)
+        elif value == 0:
+            self.active_keys.discard(name)
 
     def _code_name(self, code: int) -> str:
-        """Return a stable name for a key/button code."""
         cached = self._name_cache.get(code)
         if cached:
             return cached
 
         if code in ecodes.KEY:
             name = ecodes.KEY[code]
-            self._name_cache[code] = name
-            return name
+        else:
+            name = str(code)
+        self._name_cache[code] = name
+        return name
 
-        for name, value in ecodes.ecodes.items():
-            if value == code:
-                self._name_cache[code] = name
-                return name
-
-        unknown = str(code)
-        self._name_cache[code] = unknown
-        return unknown
-
-    def _handle_action(self, action: Action, event):
-        """Apply action based on incoming key event."""
-        if action.type == ActionType.NONE:
-            logger.debug("[%s] action none (drop event)", self.config.device_path)
-            return
-
-        if action.type == ActionType.KEYSTROKE:
-            target = action.payload.get("key")
-            if target:
-                code = ecodes.ecodes.get(target)
-                if code:
-                    sink = self._sink
-                    if sink is None:
-                        logger.warning(
-                            "[%s] no keyboard sink for keystroke emission",
-                            self.config.device_path,
-                        )
-                        return
-                    sink.write(ecodes.EV_KEY, code, event.value)
-                    sink.syn()
-                    if event.value == 1:
-                        logger.debug(
-                            "[%s] emitted keystroke: %s",
-                            self.config.device_path,
-                            target,
-                        )
-                else:
-                    logger.warning("[%s] unknown keystroke target: %s", self.config.device_path, target)
-            return
-
-        if event.value != 1:  # only act on key-down for other actions
-            return
-
-        if action.type == ActionType.SCROLL_UP:
-            sink = self._pointer_sink or self._sink
-            if sink is None:
-                return
-            sink.write(ecodes.EV_REL, ecodes.REL_WHEEL, 1)
-            logger.debug("[%s] emitted scroll up", self.config.device_path)
-        elif action.type == ActionType.SCROLL_DOWN:
-            sink = self._pointer_sink or self._sink
-            if sink is None:
-                return
-            sink.write(ecodes.EV_REL, ecodes.REL_WHEEL, -1)
-            logger.debug("[%s] emitted scroll down", self.config.device_path)
-        elif action.type == ActionType.MOUSE_BUTTON_X1:
-            sink = self._pointer_sink or self._sink
-            if sink is None:
-                return
-            sink.write(ecodes.EV_KEY, ecodes.BTN_SIDE, 1)
-            sink.write(ecodes.EV_KEY, ecodes.BTN_SIDE, 0)
-            logger.debug("[%s] emitted mouse button X1", self.config.device_path)
-        elif action.type == ActionType.MOUSE_BUTTON_X2:
-            sink = self._pointer_sink or self._sink
-            if sink is None:
-                return
-            sink.write(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1)
-            sink.write(ecodes.EV_KEY, ecodes.BTN_EXTRA, 0)
-            logger.debug("[%s] emitted mouse button X2", self.config.device_path)
-
-        sink = self._pointer_sink or self._sink
-        sink.syn()
-
-    def _build_caps(self, raw_caps):
-        """
-        Build a clean capabilities dict for uinput with only EV_KEY/EV_REL
-        and inject required extra codes.
-        """
+    def _build_caps(self, raw_caps: Dict[int, Iterable[int]]) -> Dict[int, list[int]]:
         keys = set(raw_caps.get(ecodes.EV_KEY, []))
         rels = set(raw_caps.get(ecodes.EV_REL, []))
 
-        # Add requirements based on configured actions
         for action in self.config.mappings.values():
-            if action.type == ActionType.KEYSTROKE:
-                target = action.payload.get("key")
-                code = ecodes.ecodes.get(target) if target else None
-                if code:
-                    keys.add(code)
-            elif action.type == ActionType.MOUSE_BUTTON_X1:
-                keys.add(ecodes.BTN_SIDE)
-            elif action.type == ActionType.MOUSE_BUTTON_X2:
-                keys.add(ecodes.BTN_EXTRA)
-            elif action.type == ActionType.SCROLL_UP or action.type == ActionType.SCROLL_DOWN:
-                rels.add(ecodes.REL_WHEEL)
+            keys.update(action.strategy.required_key_codes())
+            rels.update(action.strategy.required_rel_codes())
 
-        caps = {}
+        caps: Dict[int, list[int]] = {}
         if keys:
-            caps[ecodes.EV_KEY] = list(keys)
+            caps[ecodes.EV_KEY] = sorted(keys)
         if rels:
-            caps[ecodes.EV_REL] = list(rels)
+            caps[ecodes.EV_REL] = sorted(rels)
         return caps
 
-    def _pointer_caps(self):
-        rels = [ecodes.REL_WHEEL, ecodes.REL_X, ecodes.REL_Y]
+    def _pointer_caps(self) -> Dict[int, list[int]]:
         return {
-            ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE, ecodes.BTN_SIDE, ecodes.BTN_EXTRA],
-            ecodes.EV_REL: rels,
+            ecodes.EV_KEY: [
+                ecodes.BTN_LEFT,
+                ecodes.BTN_RIGHT,
+                ecodes.BTN_MIDDLE,
+                ecodes.BTN_SIDE,
+                ecodes.BTN_EXTRA,
+            ],
+            ecodes.EV_REL: [ecodes.REL_WHEEL, ecodes.REL_X, ecodes.REL_Y],
         }
 
     def _needs_pointer_output(self) -> bool:
-        for action in self.config.mappings.values():
-            if action.type in {
-                ActionType.SCROLL_UP,
-                ActionType.SCROLL_DOWN,
-                ActionType.MOUSE_BUTTON_X1,
-                ActionType.MOUSE_BUTTON_X2,
-            }:
-                return True
-        return False
+        return any(action.strategy.prefers_pointer_output() for action in self.config.mappings.values())
 
     def _needs_keystroke_output(self) -> bool:
-        for action in self.config.mappings.values():
-            if action.type == ActionType.KEYSTROKE:
-                return True
-        return False
+        return any(not action.strategy.prefers_pointer_output() for action in self.config.mappings.values())
+
+
+__all__ = ["InputMapper", "MappingConfig"]

@@ -1,937 +1,860 @@
+from __future__ import annotations
+
 import logging
-import os
 import queue
 import select
 import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 from evdev import InputDevice, ecodes
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
-    QDialog,
-    QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
-    QSpacerItem,
-    QStackedWidget,
+    QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from synapse_like.gui.constants import (
-    FULL_KEY_CAPTURE_SEQUENCE,
-    KEY_ALIASES,
-    KEYBOARD_LAYOUT,
-    KEYMAP,
-    MOUSE_ALIASES,
-    MOUSEMAP,
-    MX_CAPTURE_SEQUENCE,
-    SUB_TAB_ORDER,
-    TOP_TAB_ORDER,
-)
-from synapse_like.gui.device_paths import card_name, detect_razer_devices, expand_related_paths, path_kind
+from synapse_like.adapters.openrazer import OpenRazerAdapter
+from synapse_like.gui.constants import KEY_ALIASES, KEYMAP, MOUSE_ALIASES, MOUSEMAP
+from synapse_like.gui.device_manager import DeviceInfo, DeviceManager
 from synapse_like.gui.dialogs import ActionDialog
 from synapse_like.gui.icons import build_app_icon
-from synapse_like.gui.mapping_io import load_mapping_file, save_mapping_file
+from synapse_like.gui.profile_service import ProfileService, ProfileSummary
+from synapse_like.gui.remap_service import RemapService
 from synapse_like.gui.theme import STYLE_SHEET
 from synapse_like.gui.utils import event_code_name
+from synapse_like.gui.widgets.keyboard_svg import KeyboardSvgWidget
+from synapse_like.gui.widgets.macro_editor import MacroEditorWidget
+from synapse_like.gui.widgets.mouse_svg import MouseSvgWidget
 from synapse_like.remap.actions import Action, ActionType
-from synapse_like.remap.mapper import InputMapper, MappingConfig
-from synapse_like.remap.strategy import extract_mapped_codes, is_aux_pointer_only_mapping
+from synapse_like.remap.device_paths import expand_related_paths
+from synapse_like.remap.window_monitor import WindowMonitor
 
 logger = logging.getLogger(__name__)
 
+KEY_LABEL_BY_CODE = {code: label for label, code in KEYMAP.items()}
 
-class RemapGUI(QWidget):
+
+class GuiSignals(QObject):
+    window_changed = Signal(str)
+    devices_changed = Signal(list)
+
+
+class RemapGUI(QMainWindow):
     def __init__(self, app_icon=None):
         super().__init__()
         self.setWindowTitle("Synapse-Like")
         self.setWindowIcon(app_icon or build_app_icon())
-        self.resize(1400, 860)
+        self.resize(1380, 900)
 
-        # Default mappings for BlackWidow Ultimate 2013 (M1=F13, M2=F14).
+        self.device_manager = DeviceManager()
+        self.profile_service = ProfileService()
+        self.remap_service = RemapService()
+        self.window_monitor = WindowMonitor()
+        self.hardware_adapter = OpenRazerAdapter()
+        self.gui_signals = GuiSignals()
+
         self.mappings: Dict[str, Action] = {
             "KEY_F13": Action(ActionType.SCROLL_UP),
             "KEY_F14": Action(ActionType.SCROLL_DOWN),
         }
-        self.label_actions: Dict[str, Action] = {}
         self.dynamic_aliases: Dict[str, List[str]] = {}
         self.key_id_map: Dict[str, Dict[str, str]] = {}
-        self.mappers: List[InputMapper] = []
-        self.detected_devices = detect_razer_devices()
+        self.linked_apps: List[str] = []
+        self.current_profile: Optional[ProfileSummary] = None
 
-        self.keyboard_buttons: Dict[str, QPushButton] = {}
-        self.mouse_buttons: Dict[str, QPushButton] = {}
-        self.top_tabs: Dict[str, QPushButton] = {}
-        self.sub_tabs: Dict[str, QPushButton] = {}
-        self.current_top_tab = "TECLADO"
-
-        self.capture_thread: threading.Thread | None = None
-        self.capture_queue: queue.Queue[Tuple[str, str, str, str] | Tuple[str, str]] = queue.Queue()
-        self.capture_stop = threading.Event()
         self.capture_active = False
         self.capture_mode = ""
         self.capture_sequence: List[str] = []
-        self.capture_idx = 0
+        self.capture_index = 0
         self.capture_paths: List[str] = []
+        self.capture_thread: Optional[threading.Thread] = None
+        self.capture_queue: queue.Queue[tuple] = queue.Queue()
+        self.capture_stop = threading.Event()
+        self._last_macro_timestamp: Optional[float] = None
+        self._quit_requested = False
 
-        self.capture_timer = QTimer(self)
-        self.capture_timer.setInterval(100)
-        self.capture_timer.timeout.connect(self._poll_capture_queue)
-        self.capture_timer.start()
-
-        self.service_thread: threading.Thread | None = None
-        self.service_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
-        self.service_busy = False
         self.service_timer = QTimer(self)
         self.service_timer.setInterval(40)
         self.service_timer.timeout.connect(self._poll_service_queue)
-        self.service_timer.start()
+
+        self.capture_timer = QTimer(self)
+        self.capture_timer.setInterval(40)
+        self.capture_timer.timeout.connect(self._poll_capture_queue)
+
+        self.feedback_timer = QTimer(self)
+        self.feedback_timer.setInterval(60)
+        self.feedback_timer.timeout.connect(self._poll_feedback)
+
+        self.gui_signals.window_changed.connect(self._handle_window_changed)
+        self.gui_signals.devices_changed.connect(self._handle_devices_changed)
 
         self._build_ui()
+        self._init_tray()
         self._apply_theme()
-        self._populate_devices()
-        self._set_top_tab("TECLADO")
+        self._refresh_profiles()
+        self._populate_devices(self.device_manager.scan())
+        self._sync_visual_state()
 
-    def _build_ui(self):
-        root = QVBoxLayout()
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(10)
+        self.device_manager.subscribe(self.gui_signals.devices_changed.emit)
+        self.device_manager.start_monitoring()
+        self.window_monitor.start(self.gui_signals.window_changed.emit)
+        self.service_timer.start()
+        self.capture_timer.start()
 
-        top_bar = QFrame()
-        top_bar.setObjectName("topBar")
-        top_layout = QVBoxLayout()
-        top_layout.setContentsMargins(16, 10, 16, 10)
-        top_layout.setSpacing(8)
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(16)
 
-        primary_row = QHBoxLayout()
-        primary_row.setSpacing(8)
-        for tab_name in TOP_TAB_ORDER:
-            button = QPushButton(tab_name)
-            button.setCheckable(True)
-            button.setObjectName("topTab")
-            button.clicked.connect(lambda _, name=tab_name: self._set_top_tab(name))
-            self.top_tabs[tab_name] = button
-            primary_row.addWidget(button)
-        primary_row.addSpacerItem(
-            QSpacerItem(30, 10, QSizePolicy.Expanding, QSizePolicy.Minimum)
-        )
-        logo = QLabel("RAZER")
-        logo.setObjectName("brand")
-        primary_row.addWidget(logo)
-        top_layout.addLayout(primary_row)
-
-        sub_row = QHBoxLayout()
-        sub_row.setSpacing(6)
-        for tab_name in SUB_TAB_ORDER:
-            button = QPushButton(tab_name)
-            button.setCheckable(True)
-            button.setObjectName("subTab")
-            button.setChecked(tab_name == "PERSONALIZAR")
-            self.sub_tabs[tab_name] = button
-            sub_row.addWidget(button)
-        sub_row.addSpacerItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        top_layout.addLayout(sub_row)
-        top_bar.setLayout(top_layout)
-        root.addWidget(top_bar)
-
-        body = QFrame()
-        body.setObjectName("bodyFrame")
-        body_layout = QHBoxLayout()
-        body_layout.setContentsMargins(14, 14, 14, 14)
-        body_layout.setSpacing(14)
-        body_layout.addWidget(self._build_left_panel(), 0)
-
-        self.page_stack = QStackedWidget()
-        self.page_stack.addWidget(self._build_keyboard_page())
-        self.page_stack.addWidget(self._build_mouse_page())
-        self.page_stack.addWidget(self._build_macros_page())
-        body_layout.addWidget(self.page_stack, 1)
-
-        body.setLayout(body_layout)
-        root.addWidget(body, 1)
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        body.addWidget(self._build_sidebar(), 0)
+        body.addWidget(self._build_tabs(), 1)
+        root.addLayout(body, 1)
         root.addWidget(self._build_device_dock())
-        self.setLayout(root)
 
-    def _build_left_panel(self) -> QWidget:
+        self.status_label = QLabel("Pronto.")
+        self.status_label.setObjectName("statusLabel")
+        root.addWidget(self.status_label)
+
+        self.setCentralWidget(central)
+
+    def _build_sidebar(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("leftPanel")
-        panel.setMinimumWidth(320)
-        
-        main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(16)
+        panel.setMinimumWidth(340)
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(14)
 
-        # --- Profiles Card ---
-        profile_card = QFrame()
-        profile_card.setProperty("class", "card")
-        p_layout = QVBoxLayout()
-        p_layout.setContentsMargins(16, 16, 16, 16)
-        p_layout.setSpacing(10)
-        
-        lbl_profile = QLabel("PERFIL")
-        lbl_profile.setProperty("class", "cardTitle")
-        p_layout.addWidget(lbl_profile)
-
-        self.profile_combo = QComboBox()
-        self.profile_combo.addItems(["Default", "Work", "Gaming"])
-        p_layout.addWidget(self.profile_combo)
-
-        profile_actions = QHBoxLayout()
-        profile_actions.setSpacing(8)
-        for text in ["+", "Rename", "Delete"]:
-            btn = QPushButton(text)
-            btn.setProperty("class", "iconBtn")
-            profile_actions.addWidget(btn)
-        p_layout.addLayout(profile_actions)
-
-        lbl_name = QLabel("NOME DO PERFIL")
-        lbl_name.setProperty("class", "fieldLabel")
-        p_layout.addWidget(lbl_name)
-        
-        self.profile_name = QLineEdit("Default")
-        p_layout.addWidget(self.profile_name)
-
-        # Shortcuts section in profile card
-        lbl_shortcut = QLabel("ATALHO DE TROCA")
-        lbl_shortcut.setProperty("class", "fieldLabel")
-        p_layout.addWidget(lbl_shortcut)
-        
-        self.shortcut_combo = QComboBox()
-        self.shortcut_combo.addItems(["FN + 1", "FN + 2", "FN + 3", "None"])
-        p_layout.addWidget(self.shortcut_combo)
-
-        self.link_program_cb = QCheckBox("Vincular programa")
-        p_layout.addWidget(self.link_program_cb)
-        
-        profile_card.setLayout(p_layout)
-        main_layout.addWidget(profile_card)
-
-        # --- Device / Actions Card ---
-        action_card = QFrame()
-        action_card.setProperty("class", "card")
-        a_layout = QVBoxLayout()
-        a_layout.setContentsMargins(16, 16, 16, 16)
-        a_layout.setSpacing(10)
-
-        lbl_device = QLabel("DEVICE PATH")
-        lbl_device.setProperty("class", "cardTitle")
-        a_layout.addWidget(lbl_device)
-
-        device_row = QHBoxLayout()
-        self.device_combo = QComboBox()
-        self.device_combo.currentIndexChanged.connect(self._combo_to_input)
-        self.device_input = QLineEdit()
-        self.device_input.setPlaceholderText("/dev/input/by-id/...")
-        device_row.addWidget(self.device_combo, 1)
-        device_row.addWidget(self.device_input, 2)
-        a_layout.addLayout(device_row)
-
-        a_layout.addSpacing(10)
-        lbl_actions = QLabel("ACOES")
-        lbl_actions.setProperty("class", "cardTitle")
-        a_layout.addWidget(lbl_actions)
-
-        self.learn_mx_btn = QPushButton("Mapear M-X (escutar)")
-        self.learn_all_btn = QPushButton("Mapear teclado completo")
-        self.save_btn = QPushButton("Salvar Profile")
-        self.load_btn = QPushButton("Carregar Profile")
-        self.apply_btn = QPushButton("APLICAR NO SYSTEMA")
-        self.apply_btn.setProperty("class", "primaryBtn")
-        self.stop_btn = QPushButton("Parar Servico")
-        self.stop_btn.setProperty("class", "dangerBtn")
-
-        self.learn_mx_btn.clicked.connect(self._toggle_mx_capture)
-        self.learn_all_btn.clicked.connect(self._toggle_full_capture)
-        self.save_btn.clicked.connect(self._save)
-        self.load_btn.clicked.connect(self._load)
-        self.apply_btn.clicked.connect(self._apply)
-        self.stop_btn.clicked.connect(self._stop)
-
-        for btn in [self.learn_mx_btn, self.learn_all_btn, self.save_btn, self.load_btn]:
-            btn.setProperty("class", "secondaryBtn")
-            a_layout.addWidget(btn)
-        
-        a_layout.addSpacing(10)
-        a_layout.addWidget(self.apply_btn)
-        a_layout.addWidget(self.stop_btn)
-
-        action_card.setLayout(a_layout)
-        main_layout.addWidget(action_card)
-
-        # Status at bottom
-        self.status_label = QLabel("Pronto.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setObjectName("statusLabel")
-        main_layout.addWidget(self.status_label)
-        
-        main_layout.addStretch(1)
-        panel.setLayout(main_layout)
+        layout.addWidget(self._build_profile_card())
+        layout.addWidget(self._build_device_card())
+        layout.addWidget(self._build_action_card())
+        layout.addStretch(1)
         return panel
 
-    def _build_keyboard_page(self) -> QWidget:
+    def _build_profile_card(self) -> QWidget:
+        card = QFrame()
+        card.setProperty("class", "card")
+        layout = QVBoxLayout(card)
+        layout.addWidget(self._card_title("PERFIS"))
+
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentTextChanged.connect(self._on_profile_selected)
+        layout.addWidget(self.profile_combo)
+
+        form = QFormLayout()
+        self.profile_name_input = QLineEdit("Default")
+        self.linked_app_input = QLineEdit()
+        self.linked_app_input.setPlaceholderText("Ex: firefox, gimp")
+        self.linked_app_input.textChanged.connect(self._update_linked_apps)
+        form.addRow("Nome", self.profile_name_input)
+        form.addRow("Auto-Switch", self.linked_app_input)
+        layout.addLayout(form)
+
+        button_grid = QGridLayout()
+        self.new_profile_btn = QPushButton("Novo")
+        self.load_profile_btn = QPushButton("Carregar")
+        self.save_profile_btn = QPushButton("Salvar")
+        self.delete_profile_btn = QPushButton("Excluir")
+        self.new_profile_btn.clicked.connect(self._new_profile)
+        self.load_profile_btn.clicked.connect(self._load_selected_profile)
+        self.save_profile_btn.clicked.connect(self._save_current_profile)
+        self.delete_profile_btn.clicked.connect(self._delete_selected_profile)
+        for button in (
+            self.new_profile_btn,
+            self.load_profile_btn,
+            self.save_profile_btn,
+            self.delete_profile_btn,
+        ):
+            button.setProperty("class", "secondaryBtn")
+        button_grid.addWidget(self.new_profile_btn, 0, 0)
+        button_grid.addWidget(self.load_profile_btn, 0, 1)
+        button_grid.addWidget(self.save_profile_btn, 1, 0)
+        button_grid.addWidget(self.delete_profile_btn, 1, 1)
+        layout.addLayout(button_grid)
+        return card
+
+    def _build_device_card(self) -> QWidget:
+        card = QFrame()
+        card.setProperty("class", "card")
+        layout = QVBoxLayout(card)
+        layout.addWidget(self._card_title("DISPOSITIVO"))
+
+        self.device_combo = QComboBox()
+        self.device_combo.setEditable(True)
+        layout.addWidget(self.device_combo)
+
+        self.learn_mx_btn = QPushButton("Aprender M-Keys")
+        self.learn_all_btn = QPushButton("Aprender Teclado")
+        self.learn_mx_btn.clicked.connect(self._toggle_mx_capture)
+        self.learn_all_btn.clicked.connect(self._toggle_full_capture)
+        self.learn_mx_btn.setProperty("class", "secondaryBtn")
+        self.learn_all_btn.setProperty("class", "secondaryBtn")
+        layout.addWidget(self.learn_mx_btn)
+        layout.addWidget(self.learn_all_btn)
+        return card
+
+    def _build_action_card(self) -> QWidget:
+        card = QFrame()
+        card.setProperty("class", "card")
+        layout = QVBoxLayout(card)
+        layout.addWidget(self._card_title("SERVICO"))
+
+        self.apply_btn = QPushButton("Aplicar Remap")
+        self.apply_btn.setProperty("class", "primaryBtn")
+        self.stop_btn = QPushButton("Parar Remap")
+        self.stop_btn.setProperty("class", "dangerBtn")
+        self.persist_btn = QPushButton("Salvar na Memoria do Dispositivo")
+        self.persist_btn.setProperty("class", "secondaryBtn")
+        self.apply_btn.clicked.connect(self._apply)
+        self.stop_btn.clicked.connect(self._stop)
+        self.persist_btn.clicked.connect(self._persist_to_device)
+
+        layout.addWidget(self.apply_btn)
+        layout.addWidget(self.stop_btn)
+        layout.addWidget(self.persist_btn)
+        return card
+
+    def _build_tabs(self) -> QWidget:
+        self.tab_widget = QTabWidget()
+        self.tab_widget.addTab(self._build_keyboard_tab(), "Teclado")
+        self.tab_widget.addTab(self._build_mouse_tab(), "Mouse")
+        self.tab_widget.addTab(self._build_macros_tab(), "Macros")
+        return self.tab_widget
+
+    def _build_keyboard_tab(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
-        layout.addWidget(self._section_title("TECLADO - PERSONALIZAR"))
-
-        keyboard_frame = QFrame()
-        keyboard_frame.setObjectName("keyboardFrame")
-        grid = QGridLayout()
-        grid.setContentsMargins(14, 14, 14, 14)
-        grid.setVerticalSpacing(6)
-        grid.setHorizontalSpacing(6)
-
-        for row_index, row in enumerate(KEYBOARD_LAYOUT):
-            col = 0
-            for key_label, span in row:
-                button = QPushButton(key_label)
-                button.setObjectName("keyButton")
-                button.setProperty("mapped", "false")
-                button.setFixedHeight(34)
-                if key_label in KEYMAP:
-                    button.clicked.connect(
-                        lambda _, label=key_label: self._choose_action(label, KEYMAP[label])
-                    )
-                    self.keyboard_buttons[key_label] = button
-                grid.addWidget(button, row_index, col, 1, span)
-                col += span
-
-        keyboard_frame.setLayout(grid)
-        layout.addWidget(keyboard_frame)
-        page.setLayout(layout)
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._section_title("MAPEAMENTO VISUAL"))
+        self.keyboard_svg = KeyboardSvgWidget()
+        self.keyboard_svg.clicked.connect(self._choose_keyboard_action)
+        layout.addWidget(self.keyboard_svg, 1)
         return page
 
-    def _build_mouse_page(self) -> QWidget:
+    def _build_mouse_tab(self) -> QWidget:
         page = QWidget()
-        layout = QHBoxLayout()
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(16)
-
-        list_panel = QFrame()
-        list_panel.setObjectName("mouseListPanel")
-        list_layout = QVBoxLayout()
-        list_layout.addWidget(self._section_title("MOUSE - PERSONALIZAR"))
-
-        for index, label in [("1", "LMB"), ("2", "MMB"), ("3", "RMB"), ("4", "M4"), ("5", "M5")]:
-            row = QHBoxLayout()
-            badge = QLabel(index)
-            badge.setObjectName("mouseBadge")
-            badge.setFixedWidth(24)
-
-            button = QPushButton(label)
-            button.setObjectName("mouseMapButton")
-            button.clicked.connect(lambda _, name=label: self._choose_action(name, MOUSEMAP[name]))
-            self.mouse_buttons[label] = button
-
-            row.addWidget(badge)
-            row.addWidget(button, 1)
-            list_layout.addLayout(row)
-
-        list_layout.addStretch(1)
-        list_panel.setLayout(list_layout)
-        layout.addWidget(list_panel, 1)
-
-        mouse_visual = QFrame()
-        mouse_visual.setObjectName("mouseVisual")
-        visual_layout = QVBoxLayout()
-        visual_layout.addWidget(self._section_title("DIAGRAMA DO MOUSE"))
-        visual_grid = QGridLayout()
-        visual_grid.setVerticalSpacing(10)
-        visual_grid.setHorizontalSpacing(10)
-        for index, label in enumerate(["LMB", "RMB", "MMB", "M4", "M5"], start=1):
-            button = QPushButton(f"{index} - {label}")
-            button.setObjectName("mouseNode")
-            button.clicked.connect(lambda _, name=label: self._choose_action(name, MOUSEMAP[name]))
-            visual_grid.addWidget(button, index - 1, 0)
-        visual_layout.addLayout(visual_grid)
-
-        hint = QLabel("Use a aba de desempenho/iluminacao no proximo milestone.")
-        hint.setObjectName("hintLabel")
-        visual_layout.addWidget(hint)
-        visual_layout.addStretch(1)
-        mouse_visual.setLayout(visual_layout)
-        layout.addWidget(mouse_visual, 1)
-
-        page.setLayout(layout)
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._section_title("MOUSE"))
+        self.mouse_svg = MouseSvgWidget()
+        self.mouse_svg.clicked.connect(self._choose_mouse_action)
+        layout.addWidget(self.mouse_svg, 1)
         return page
 
-    def _build_macros_page(self) -> QWidget:
+    def _build_macros_tab(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(self._section_title("MACROS"))
-        hint = QLabel("Editor de macros entra no M4. A base de remap por ID ja esta pronta.")
-        hint.setObjectName("hintLabel")
-        layout.addWidget(hint)
-        layout.addStretch(1)
-        page.setLayout(layout)
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._section_title("EDITOR DE MACROS"))
+        self.macro_editor = MacroEditorWidget()
+        self.macro_editor.request_record_start.connect(self._start_macro_record)
+        self.macro_editor.request_record_stop.connect(self._stop_macro_record)
+        layout.addWidget(self.macro_editor, 1)
         return page
 
     def _build_device_dock(self) -> QWidget:
         dock = QFrame()
         dock.setObjectName("deviceDock")
-        layout = QHBoxLayout()
+        layout = QHBoxLayout(dock)
         layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(10)
-        layout.addWidget(self._section_title("DISPOSITIVOS"))
-
-        self.device_cards_row = QHBoxLayout()
-        self.device_cards_row.setSpacing(8)
-        layout.addLayout(self.device_cards_row, 1)
-        dock.setLayout(layout)
+        layout.addWidget(self._section_title("DISPOSITIVOS DETECTADOS"))
+        self.device_cards_layout = QHBoxLayout()
+        self.device_cards_layout.setSpacing(8)
+        layout.addLayout(self.device_cards_layout, 1)
         return dock
 
-    def _apply_theme(self):
-        self.setStyleSheet(STYLE_SHEET)
+    def _card_title(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setProperty("class", "cardTitle")
+        return label
 
     def _section_title(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setObjectName("pageTitle")
         return label
 
-    def _set_top_tab(self, tab_name: str):
-        self.current_top_tab = tab_name
-        for name, button in self.top_tabs.items():
-            button.setChecked(name == tab_name)
-        for name, button in self.sub_tabs.items():
-            if tab_name == "MACROS":
-                button.setChecked(False)
+    def _apply_theme(self) -> None:
+        self.setStyleSheet(STYLE_SHEET)
+
+    def _init_tray(self) -> None:
+        self.tray_icon = QSystemTrayIcon(build_app_icon(), self)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_menu = QMenu(self)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.show()
+        self._rebuild_tray_menu()
+
+    def _rebuild_tray_menu(self) -> None:
+        self.tray_menu.clear()
+        open_action = QAction("Mostrar Janela", self)
+        open_action.triggered.connect(self._restore_from_tray)
+        self.tray_menu.addAction(open_action)
+
+        toggle_action = QAction("Parar Remap" if self.remap_service.is_active() else "Aplicar Remap", self)
+        toggle_action.triggered.connect(self._stop if self.remap_service.is_active() else self._apply)
+        self.tray_menu.addAction(toggle_action)
+        self.tray_menu.addSeparator()
+
+        profiles_menu = self.tray_menu.addMenu("Perfis")
+        for profile in self.profile_service.list_profiles():
+            action = profiles_menu.addAction(profile.name)
+            action.triggered.connect(
+                lambda checked=False, profile_name=profile.name: self._load_named_profile(profile_name, apply_after_load=True)
+            )
+
+        self.tray_menu.addSeparator()
+        quit_action = QAction("Sair", self)
+        quit_action.triggered.connect(self._quit_from_tray)
+        self.tray_menu.addAction(quit_action)
+
+    def _refresh_profiles(self) -> None:
+        profiles = self.profile_service.list_profiles()
+        current_name = self.current_profile.name if self.current_profile else self.profile_combo.currentText()
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItems([profile.name for profile in profiles])
+        self.profile_combo.blockSignals(False)
+        if profiles:
+            if current_name and current_name in [profile.name for profile in profiles]:
+                self.profile_combo.setCurrentText(current_name)
             else:
-                button.setChecked(name == "PERSONALIZAR")
+                self.profile_combo.setCurrentIndex(0)
+        self._rebuild_tray_menu()
 
-        if tab_name == "TECLADO":
-            self.page_stack.setCurrentIndex(0)
-        elif tab_name == "MOUSE":
-            self.page_stack.setCurrentIndex(1)
-        else:
-            self.page_stack.setCurrentIndex(2)
+    def _populate_devices(self, devices: Iterable[DeviceInfo]) -> None:
+        current_path = self.device_combo.currentText().strip()
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+        device_list = list(devices)
+        for device in device_list:
+            self.device_combo.addItem(device.path)
+        self.device_combo.blockSignals(False)
 
-    def _choose_action(self, label: str, fallback_code: str):
+        if current_path:
+            self.device_combo.setCurrentText(current_path)
+        elif device_list:
+            self.device_combo.setCurrentText(device_list[0].path)
+
+        while self.device_cards_layout.count():
+            item = self.device_cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        for device in self.device_manager.get_primary_devices():
+            card = QFrame()
+            card.setObjectName("deviceCard")
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(10, 8, 10, 8)
+            layout.addWidget(QLabel(device.name))
+            layout.addWidget(QLabel(device.kind.title()))
+            self.device_cards_layout.addWidget(card)
+
+    def _sync_visual_state(self) -> None:
+        keyboard_codes: set[str] = set()
+        mouse_labels: set[str] = set()
+        keyboard_tooltips: dict[str, str] = {}
+        mouse_tooltips: dict[str, str] = {}
+
+        for label, fallback in KEYMAP.items():
+            action = self._action_for_label(label, fallback)
+            if not action or action.type == ActionType.NONE:
+                continue
+            keyboard_codes.add(fallback)
+            keyboard_tooltips[fallback] = f"{label}: {self._action_text(action)}"
+
+        for label, fallback in MOUSEMAP.items():
+            action = self._action_for_label(label, fallback)
+            if not action or action.type == ActionType.NONE:
+                continue
+            mouse_labels.add(label)
+            mouse_tooltips[label] = f"{label}: {self._action_text(action)}"
+
+        self.keyboard_svg.set_mapped_keys(keyboard_codes)
+        self.keyboard_svg.set_tooltip_map(keyboard_tooltips)
+        self.mouse_svg.set_mapped_buttons(mouse_labels)
+        self.mouse_svg.set_tooltip_map(mouse_tooltips)
+
+    def _choose_keyboard_action(self, key_code: str) -> None:
+        label = KEY_LABEL_BY_CODE.get(key_code, key_code)
+        self._choose_action(label, key_code)
+
+    def _choose_mouse_action(self, label: str) -> None:
+        self._choose_action(label, MOUSEMAP[label])
+
+    def _choose_action(self, label: str, fallback_code: str) -> None:
         dialog = ActionDialog(label, self)
-        if dialog.exec() != QDialog.Accepted:
+        current_action = self._action_for_label(label, fallback_code)
+        if current_action:
+            dialog.set_action(current_action)
+        if dialog.exec() != dialog.Accepted:
             return
 
         action = dialog.get_action()
+        if action.type == ActionType.MACRO:
+            action = Action(ActionType.MACRO, {"events": self.macro_editor.events})
+
         codes = self._codes_for_label(label, fallback_code)
         if action.type == ActionType.NONE:
             for code in codes:
                 self.mappings.pop(code, None)
-            self.label_actions.pop(label, None)
         else:
             for code in codes:
                 self.mappings[code] = action
-            self.label_actions[label] = action
-        self._refresh_label_visual(label)
-        self.status_label.setText(f"{label} -> {action.type.value} [{', '.join(codes)}]")
 
-    def _refresh_label_visual(self, label: str):
-        action = self.label_actions.get(label)
-        mapped = action is not None and action.type != ActionType.NONE
-        tooltip = label
-        if label in self.key_id_map:
-            learned = self.key_id_map[label]
-            tooltip += f" | ID: {learned.get('symbolic')} ({learned.get('numeric')})"
-        if mapped:
-            tooltip += f" | Acao: {self._action_text(action)}"
+        self._sync_visual_state()
+        self._set_status(f"{label} -> {self._action_text(action)}")
 
-        if label in self.keyboard_buttons:
-            button = self.keyboard_buttons[label]
-            button.setProperty("mapped", "true" if mapped else "false")
-            button.setToolTip(tooltip)
-            button.style().unpolish(button)
-            button.style().polish(button)
-        if label in self.mouse_buttons:
-            button = self.mouse_buttons[label]
-            action_text = self._action_text(action) if mapped else "Pass-through"
-            button.setText(f"{label}  |  {action_text}")
-            button.setToolTip(tooltip)
+    def _action_for_label(self, label: str, fallback_code: str) -> Optional[Action]:
+        for code in self._codes_for_label(label, fallback_code):
+            action = self.mappings.get(code)
+            if action is not None:
+                return action
+        return None
 
-    @staticmethod
-    def _action_text(action: Action | None) -> str:
-        if not action:
-            return "Pass-through"
-        if action.type == ActionType.KEYSTROKE:
-            return f"Keystroke {action.payload.get('key', '')}".strip()
-        return action.type.value
+    def _codes_for_label(self, label: str, fallback_code: str) -> list[str]:
+        if label in self.dynamic_aliases:
+            return self.dynamic_aliases[label]
+        if label in KEY_ALIASES:
+            return KEY_ALIASES[label]
+        if label in MOUSE_ALIASES:
+            return MOUSE_ALIASES[label]
+        return [fallback_code]
 
-    def _toggle_mx_capture(self):
+    def _save_current_profile(self) -> None:
+        profile_name = self.profile_name_input.text().strip() or "Default"
+        path = self.profile_service.save_named_profile(
+            name=profile_name,
+            device_path=self.device_combo.currentText().strip(),
+            mappings=self.mappings,
+            dynamic_aliases=self.dynamic_aliases,
+            key_id_map=self.key_id_map,
+            linked_apps=self.linked_apps,
+        )
+        self.current_profile = ProfileSummary(
+            name=profile_name,
+            path=path,
+            linked_apps=[app.casefold() for app in self.linked_apps],
+            device_path=self.device_combo.currentText().strip(),
+        )
+        self._refresh_profiles()
+        self.profile_combo.setCurrentText(profile_name)
+        self._set_status(f"Perfil salvo em {path}")
+
+    def _load_selected_profile(self) -> None:
+        profile_name = self.profile_combo.currentText().strip()
+        if not profile_name:
+            QMessageBox.information(self, "Perfis", "Nenhum perfil salvo ainda.")
+            return
+        self._load_named_profile(profile_name)
+
+    def _load_named_profile(self, profile_name: str, apply_after_load: bool = False) -> None:
+        try:
+            device_path, mappings, dynamic_aliases, key_id_map, linked_apps = self.profile_service.load_named_profile(profile_name)
+        except Exception as exc:
+            QMessageBox.critical(self, "Perfil", f"Nao foi possivel carregar o perfil: {exc}")
+            return
+
+        self.mappings = mappings
+        self.dynamic_aliases = dynamic_aliases
+        self.key_id_map = key_id_map
+        self.linked_apps = linked_apps
+        self.profile_name_input.setText(profile_name)
+        self.linked_app_input.setText(", ".join(linked_apps))
+        if device_path:
+            self.device_combo.setCurrentText(device_path)
+        self.current_profile = ProfileSummary(
+            name=profile_name,
+            path=self.profile_service.get_profile_path(profile_name),
+            linked_apps=[app.casefold() for app in linked_apps],
+            device_path=device_path,
+        )
+        self._sync_visual_state()
+        self._set_status(f"Perfil '{profile_name}' carregado.")
+        if apply_after_load and self.device_combo.currentText().strip():
+            self._apply()
+
+    def _delete_selected_profile(self) -> None:
+        profile_name = self.profile_combo.currentText().strip()
+        if not profile_name:
+            return
+        if not self.profile_service.delete_profile(profile_name):
+            return
+        if self.current_profile and self.current_profile.name == profile_name:
+            self.current_profile = None
+        self._refresh_profiles()
+        self._set_status(f"Perfil '{profile_name}' removido.")
+
+    def _new_profile(self) -> None:
+        self.current_profile = None
+        self.profile_name_input.setText("Novo Perfil")
+        self.linked_app_input.clear()
+        self.mappings = {
+            "KEY_F13": Action(ActionType.SCROLL_UP),
+            "KEY_F14": Action(ActionType.SCROLL_DOWN),
+        }
+        self.dynamic_aliases = {}
+        self.key_id_map = {}
+        self.linked_apps = []
+        self.macro_editor.clear_events()
+        self._sync_visual_state()
+        self._set_status("Perfil limpo.")
+
+    def _on_profile_selected(self, profile_name: str) -> None:
+        if profile_name:
+            self.profile_name_input.setText(profile_name)
+
+    def _toggle_mx_capture(self) -> None:
         if self.capture_active:
             self._stop_capture("Escuta cancelada.")
             return
-        self._start_capture(MX_CAPTURE_SEQUENCE, mode="mx")
+        self._start_capture(["M5", "M4", "M3", "M2", "M1"], mode="learn")
 
-    def _toggle_full_capture(self):
+    def _toggle_full_capture(self) -> None:
         if self.capture_active:
             self._stop_capture("Escuta cancelada.")
             return
-        self._start_capture(FULL_KEY_CAPTURE_SEQUENCE, mode="full")
+        sequence = [label for label in KEYMAP if label in KEYMAP]
+        self._start_capture(sequence, mode="learn")
 
-    def _start_capture(self, sequence: List[str], mode: str):
-        device = self.device_input.text().strip()
+    def _start_macro_record(self) -> None:
+        self._start_capture([], mode="macro")
+        self._set_status("Gravando macro...")
+
+    def _stop_macro_record(self) -> None:
+        self._stop_capture("Gravacao de macro finalizada.")
+
+    def _start_capture(self, sequence: list[str], mode: str) -> None:
+        device = self.device_combo.currentText().strip()
         if not device:
-            QMessageBox.warning(self, "Device", "Informe o caminho do device antes da escuta.")
+            QMessageBox.warning(self, "Device", "Selecione um device antes de iniciar a escuta.")
             return
 
-        self._stop()
         paths = expand_related_paths(device)
         if not paths:
-            QMessageBox.warning(self, "Device", "Nenhum device de evento foi encontrado.")
+            QMessageBox.warning(self, "Device", "Nenhuma interface de evento foi encontrada.")
             return
 
-        self.capture_sequence = sequence
         self.capture_mode = mode
-        self.capture_idx = 0
+        self.capture_sequence = sequence
+        self.capture_index = 0
         self.capture_paths = paths
-        self.capture_stop.clear()
         self.capture_active = True
+        self.capture_stop.clear()
+        self._last_macro_timestamp = None
 
-        self.learn_mx_btn.setText("Parar escuta M-X")
-        self.learn_all_btn.setText("Parar escuta completa")
-        self._show_capture_prompt()
-
+        self.learn_mx_btn.setText("Parar Escuta")
+        self.learn_all_btn.setText("Parar Escuta")
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
+        if mode == "learn":
+            self._show_capture_prompt()
 
-    def _stop_capture(self, message: str = ""):
-        if self.capture_active:
-            self.capture_stop.set()
-            self.capture_active = False
-
-        self.learn_mx_btn.setText("Mapear M-X (escutar)")
-        self.learn_all_btn.setText("Mapear teclado completo (ID)")
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=0.6)
-        self.capture_thread = None
+    def _stop_capture(self, message: str = "") -> None:
+        self.capture_stop.set()
+        self.capture_active = False
         self.capture_mode = ""
         self.capture_sequence = []
+        self.capture_paths = []
+        self.learn_mx_btn.setText("Aprender M-Keys")
+        self.learn_all_btn.setText("Aprender Teclado")
+        if self.capture_thread and self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=0.4)
+        self.capture_thread = None
+        self.macro_editor.stop_recording_ui()
         if message:
-            self.status_label.setText(message)
+            self._set_status(message)
 
-    def _show_capture_prompt(self):
-        if self.capture_idx >= len(self.capture_sequence):
-            if self.capture_mode == "full":
-                self._stop_capture("Mapeamento completo finalizado.")
-            else:
-                self._stop_capture("Escuta M-X concluida.")
-            return
-
-        target = self.capture_sequence[self.capture_idx]
-        total = len(self.capture_sequence)
-        current = self.capture_idx + 1
-        self.status_label.setText(f"Escutando {current}/{total}: pressione {target}.")
-
-    def _capture_loop(self):
-        devices: List[InputDevice] = []
-        failures: List[str] = []
-        for path in self.capture_paths:
-            try:
-                devices.append(InputDevice(path))
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"{path}: {exc}")
-
-        if not devices:
-            self.capture_queue.put(("error", "Falha abrindo devices:\n" + "\n".join(failures)))
-            return
-        if failures:
-            self.capture_queue.put(("warn", "Escuta parcial:\n" + "\n".join(failures)))
-
+    def _capture_loop(self) -> None:
+        devices: list[InputDevice] = []
+        failures: list[str] = []
         try:
+            for path in self.capture_paths:
+                try:
+                    devices.append(InputDevice(path))
+                except Exception as exc:
+                    failures.append(f"{path}: {exc}")
+
+            if not devices:
+                self.capture_queue.put(("error", "Falha abrindo devices", failures))
+                return
+            if failures:
+                self.capture_queue.put(("warn", "\n".join(failures)))
+
             while not self.capture_stop.is_set():
                 readable, _, _ = select.select(devices, [], [], 0.2)
-                if not readable:
-                    continue
                 for device in readable:
                     for event in device.read():
-                        if event.type != ecodes.EV_KEY or event.value != 1:
+                        if event.type != ecodes.EV_KEY or event.value == 2:
+                            continue
+                        if self.capture_mode != "macro" and event.value != 1:
                             continue
                         self.capture_queue.put(
-                            ("hit", event_code_name(event.code), str(event.code), device.path)
+                            (
+                                "hit",
+                                event_code_name(event.code),
+                                str(event.code),
+                                device.path,
+                                event.value,
+                                time.monotonic(),
+                            )
                         )
-        except Exception as exc:  # noqa: BLE001
-            self.capture_queue.put(("error", f"Erro na escuta: {exc}"))
         finally:
             for device in devices:
                 try:
                     device.close()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
-    def _poll_capture_queue(self):
+    def _poll_capture_queue(self) -> None:
         while True:
             try:
                 item = self.capture_queue.get_nowait()
             except queue.Empty:
-                break
+                return
 
             kind = item[0]
             if kind == "error":
-                self._stop_capture(item[1])
-                QMessageBox.critical(self, "Erro escuta", item[1])
+                self._stop_capture("Falha na escuta.")
+                failures = "\n".join(item[2]) if len(item) > 2 else ""
+                QMessageBox.critical(self, "Escuta", f"{item[1]}\n{failures}")
                 continue
             if kind == "warn":
-                self.status_label.setText(item[1])
-                continue
-            if kind != "hit":
-                continue
-            if not self.capture_active or self.capture_idx >= len(self.capture_sequence):
+                self._set_status(str(item[1]))
                 continue
 
-            code_name, code_num, src_path = item[1], item[2], item[3]
-            target = self.capture_sequence[self.capture_idx]
-            self._register_learned_id(target, code_name, code_num, src_path)
-            self.capture_idx += 1
+            _, code_name, code_num, path, event_value, timestamp = item
+            if self.capture_mode == "macro":
+                if self._last_macro_timestamp is not None:
+                    delay_ms = int((timestamp - self._last_macro_timestamp) * 1000)
+                    if delay_ms > 0:
+                        self.macro_editor.add_event({"type": "delay", "value": delay_ms})
+                self._last_macro_timestamp = timestamp
+                self.macro_editor.add_event({"type": "key", "code": code_name, "state": event_value})
+                continue
+
+            if not self.capture_active or self.capture_index >= len(self.capture_sequence):
+                continue
+
+            target_label = self.capture_sequence[self.capture_index]
+            self._register_learned_id(target_label, code_name, code_num, path)
+            self.capture_index += 1
             self._show_capture_prompt()
 
-    def _register_learned_id(self, label: str, code_name: str, code_num: str, src_path: str):
+    def _show_capture_prompt(self) -> None:
+        if self.capture_index >= len(self.capture_sequence):
+            self._stop_capture("Escuta finalizada.")
+            return
+        target = self.capture_sequence[self.capture_index]
+        self._set_status(f"Pressione {target} para aprender o ID.")
+
+    def _register_learned_id(self, label: str, code_name: str, code_num: str, path: str) -> None:
         aliases = [code_name, code_num]
         for value in self.dynamic_aliases.get(label, []):
             if value not in aliases:
                 aliases.append(value)
         self.dynamic_aliases[label] = aliases
-        self.key_id_map[label] = {"symbolic": code_name, "numeric": code_num, "path": src_path}
-        self._refresh_label_visual(label)
+        self.key_id_map[label] = {
+            "symbolic": code_name,
+            "numeric": code_num,
+            "path": path,
+        }
+        self._sync_visual_state()
 
-    def _save(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Salvar mapping",
-            str(Path.home() / "mapping.json"),
-        )
-        if not path:
+    def _update_linked_apps(self, text: str) -> None:
+        self.linked_apps = [app.strip().casefold() for app in text.split(",") if app.strip()]
+
+    def _apply(self) -> None:
+        if self.remap_service.is_busy():
+            self._set_status("Aguardando operação atual terminar.")
             return
-
-        save_mapping_file(
-            path=path,
-            device_path=self.device_input.text().strip(),
-            mappings=self.mappings,
-            dynamic_aliases=self.dynamic_aliases,
-            key_id_map=self.key_id_map,
-        )
-        self.status_label.setText(f"Mapping salvo em {path}")
-
-    def _load(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Carregar mapping", str(Path.home()))
-        if not path:
-            return
-
-        try:
-            device_path, mappings, dynamic_aliases, key_id_map = load_mapping_file(path)
-            self.device_input.setText(device_path)
-            self.mappings = mappings
-            self.dynamic_aliases = dynamic_aliases
-            self.key_id_map = key_id_map
-            self._rebuild_label_actions()
-            self.status_label.setText(f"Mapping carregado de {path}")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Erro", f"Nao foi possivel carregar: {exc}")
-
-    def _rebuild_label_actions(self):
-        self.label_actions = {}
-        for label, fallback in KEYMAP.items():
-            for code in self._codes_for_label(label, fallback):
-                if code in self.mappings:
-                    self.label_actions[label] = self.mappings[code]
-                    break
-            self._refresh_label_visual(label)
-        for label, fallback in MOUSEMAP.items():
-            for code in self._codes_for_label(label, fallback):
-                if code in self.mappings:
-                    self.label_actions[label] = self.mappings[code]
-                    break
-            self._refresh_label_visual(label)
-
-    def _apply(self):
-        if self.service_busy:
-            self.status_label.setText("Aguarde: operacao em andamento.")
-            return
-
-        self._stop_capture()
-        device = self.device_input.text().strip()
+        device = self.device_combo.currentText().strip()
         if not device:
-            QMessageBox.warning(self, "Device", "Informe o caminho do device.")
+            QMessageBox.warning(self, "Device", "Selecione um device antes de aplicar.")
             return
+        self._stop_capture()
+        self._set_service_busy(True, "Aplicando remap...")
+        self.remap_service.apply_configuration(device, self.mappings)
 
-        self._set_service_busy(True, "Aplicando remapper...")
-        current_mappers = self.mappers
-        self.mappers = []
-        self._run_service_task(
-            target=self._apply_worker,
-            kwargs={
-                "device": device,
-                "mappings": dict(self.mappings),
-                "previous_mappers": current_mappers,
-            },
-        )
-
-    def _stop(self):
-        if self.service_busy:
-            self.status_label.setText("Aguarde: operacao em andamento.")
+    def _stop(self) -> None:
+        if self.remap_service.is_busy():
+            self._set_status("Aguardando operação atual terminar.")
             return
-        if not self.mappers:
-            self.status_label.setText("Remapper parado.")
+        if not self.remap_service.is_active():
+            self._set_status("Remap já está parado.")
             return
+        self._set_service_busy(True, "Parando remap...")
+        self.remap_service.stop_all()
 
-        self._set_service_busy(True, "Parando remapper...")
-        current_mappers = self.mappers
-        self.mappers = []
-        self._run_service_task(
-            target=self._stop_worker,
-            kwargs={"mappers": current_mappers},
-        )
-
-    def _set_service_busy(self, busy: bool, status: str | None = None):
-        self.service_busy = busy
-        widgets = [
+    def _set_service_busy(self, busy: bool, status: str | None = None) -> None:
+        for widget in (
             self.apply_btn,
             self.stop_btn,
-            self.load_btn,
-            self.save_btn,
+            self.persist_btn,
+            self.save_profile_btn,
+            self.load_profile_btn,
+            self.new_profile_btn,
+            self.delete_profile_btn,
             self.learn_mx_btn,
             self.learn_all_btn,
             self.device_combo,
-            self.device_input,
-        ]
-        for widget in widgets:
+        ):
             widget.setEnabled(not busy)
         if status:
-            self.status_label.setText(status)
+            self._set_status(status)
 
-    def _run_service_task(self, target, kwargs: Dict[str, Any]):
-        self.service_thread = threading.Thread(target=target, kwargs=kwargs, daemon=True)
-        self.service_thread.start()
-
-    def _apply_worker(
-        self,
-        device: str,
-        mappings: Dict[str, Action],
-        previous_mappers: List[InputMapper],
-    ):
-        failures: List[str] = []
-        started: List[InputMapper] = []
-        low_latency = is_aux_pointer_only_mapping(mappings)
-
-        for mapper in previous_mappers:
-            try:
-                mapper.stop()
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"stop: {exc}")
-
-        paths = expand_related_paths(device)
-        if not paths:
-            self.service_queue.put(
-                {
-                    "kind": "apply_done",
-                    "mappers": [],
-                    "failures": failures or ["Nenhum device de evento foi encontrado."],
-                    "low_latency": low_latency,
-                    "paths": [],
-                }
-            )
-            return
-
-        paths = self._filter_paths_for_mappings(paths, mappings)
-        logger.info("Applying mapper with %d mapping entries", len(mappings))
-        logger.info("Mapper paths: %s", ", ".join(paths))
-        logger.info("Low-latency mode: %s", "enabled" if low_latency else "disabled")
-
-        for path in paths:
-            try:
-                use_fast_mode = low_latency and "-if" in path
-                mapper = InputMapper(
-                    MappingConfig(
-                        device_path=path,
-                        mappings=mappings,
-                        grab=not use_fast_mode,
-                        passthrough=not use_fast_mode,
-                    )
-                )
-                mapper.start()
-                started.append(mapper)
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"{path}: {exc}")
-
-        self.service_queue.put(
-            {
-                "kind": "apply_done",
-                "mappers": started,
-                "failures": failures,
-                "low_latency": low_latency,
-                "paths": paths,
-            }
-        )
-
-    def _stop_worker(self, mappers: List[InputMapper]):
-        failures: List[str] = []
-        for mapper in mappers:
-            try:
-                mapper.stop()
-            except Exception as exc:  # noqa: BLE001
-                failures.append(str(exc))
-        self.service_queue.put({"kind": "stop_done", "failures": failures})
-
-    def _poll_service_queue(self):
+    def _poll_service_queue(self) -> None:
         while True:
             try:
-                item = self.service_queue.get_nowait()
+                message = self.remap_service.service_queue.get_nowait()
             except queue.Empty:
-                break
+                return
 
-            kind = item.get("kind")
+            kind = message.get("kind")
             if kind == "apply_done":
-                self._handle_apply_done(item)
+                self._handle_apply_done(message)
             elif kind == "stop_done":
-                self._handle_stop_done(item)
+                self._handle_stop_done(message)
 
-    def _handle_apply_done(self, result: Dict[str, Any]):
+    def _handle_apply_done(self, message: Dict[str, Any]) -> None:
         self._set_service_busy(False)
-        self.mappers = result.get("mappers", [])
-        failures = result.get("failures", [])
-        if not self.mappers:
-            QMessageBox.critical(
-                self,
-                "Erro",
-                "Falha ao iniciar remapper:\n" + "\n".join(failures or ["Erro desconhecido"]),
+        failures = message.get("failures", [])
+        active_count = int(message.get("active_count", 0))
+        if active_count == 0:
+            QMessageBox.critical(self, "Remap", "\n".join(failures or ["Falha ao iniciar mapper."]))
+            self._set_status("Remap parado.")
+            return
+        if failures:
+            QMessageBox.warning(self, "Remap", "Interfaces com falha:\n" + "\n".join(failures))
+        suffix = " (baixa latência)" if message.get("low_latency") else ""
+        self._set_status(f"Remap ativo em {active_count} interface(s){suffix}.")
+        self.feedback_timer.start()
+        self._rebuild_tray_menu()
+
+    def _handle_stop_done(self, message: Dict[str, Any]) -> None:
+        self._set_service_busy(False)
+        failures = message.get("failures", [])
+        if failures:
+            QMessageBox.warning(self, "Remap", "Falhas ao parar:\n" + "\n".join(failures))
+        self.feedback_timer.stop()
+        self._set_status("Remap parado.")
+        self._rebuild_tray_menu()
+
+    def _poll_feedback(self) -> None:
+        if not self.remap_service.is_active():
+            return
+        active_keys = self.remap_service.get_input_state()
+        self.keyboard_svg.set_active_keys(active_keys)
+        self.mouse_svg.set_active_keys(active_keys)
+
+    def _persist_to_device(self) -> None:
+        profile_name = self.profile_name_input.text().strip() or "Default"
+        payload = {
+            "device_path": self.device_combo.currentText().strip(),
+            "mappings": {key: action.to_dict() for key, action in self.mappings.items()},
+            "linked_apps": list(self.linked_apps),
+        }
+        result = self.hardware_adapter.persist_profile(profile_name, payload)
+        QMessageBox.information(self, "Persistência Onboard", result)
+        self._set_status(result)
+
+    def _handle_window_changed(self, wm_class: str) -> None:
+        profile = self.profile_service.find_profile_for_window_class(wm_class)
+        if profile is None:
+            return
+        if self.current_profile and profile.name == self.current_profile.name:
+            return
+        self._load_named_profile(profile.name, apply_after_load=self.remap_service.is_active())
+        self._set_status(f"Auto-switch: perfil '{profile.name}' ativado para {wm_class}.")
+
+    def _handle_devices_changed(self, devices: list[DeviceInfo]) -> None:
+        self._populate_devices(devices)
+        self._set_status("Hotplug detectado. Lista de devices atualizada.")
+
+    def _action_text(self, action: Action) -> str:
+        if action.type == ActionType.KEYSTROKE:
+            return f"Keystroke {action.strategy.key or ''}".strip()
+        if action.type == ActionType.MACRO:
+            event_count = len(getattr(action.strategy, "events", []))
+            return f"Macro ({event_count} eventos)"
+        if action.type == ActionType.LAUNCH_APP:
+            return f"Lançar app: {action.strategy.command}"
+        return action.type.value.replace("_", " ").title()
+
+    def _set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._quit_requested = True
+        self.close()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.Trigger:
+            if self.isVisible():
+                self.hide()
+            else:
+                self._restore_from_tray()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._quit_requested and self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "Synapse-Like",
+                "A aplicação continua rodando na bandeja do sistema.",
+                QSystemTrayIcon.Information,
+                2500,
             )
-            self.status_label.setText("Remapper parado.")
             return
 
-        if failures:
-            QMessageBox.warning(self, "Aviso", "Interfaces nao iniciaram:\n" + "\n".join(failures))
-        low_latency = result.get("low_latency", False)
-        mode_text = " (modo baixa latencia)" if low_latency else ""
-        self.status_label.setText(
-            f"Remapper ativo em {len(self.mappers)} interface(s).{mode_text}"
-        )
-
-    def _handle_stop_done(self, result: Dict[str, Any]):
-        self._set_service_busy(False)
-        failures = result.get("failures", [])
-        if failures:
-            QMessageBox.warning(self, "Aviso", "Falhas ao parar:\n" + "\n".join(failures))
-        self.status_label.setText("Remapper parado.")
-
-    def _stop_sync(self):
-        for mapper in self.mappers:
-            try:
-                mapper.stop()
-            except Exception:  # noqa: BLE001
-                pass
-        self.mappers = []
-
-    def _populate_devices(self):
-        self.device_combo.clear()
-        while self.device_cards_row.count():
-            item = self.device_cards_row.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-
-        if not self.detected_devices:
-            self.device_combo.addItem("Nenhum Razer detectado")
-            return
-
-        primary_devices = []
-        for path in self.detected_devices:
-            self.device_combo.addItem(path)
-            if path.endswith("-event-kbd") or path.endswith("-event-mouse"):
-                primary_devices.append(path)
-
-        cards = primary_devices if primary_devices else self.detected_devices[:4]
-        for path in cards[:4]:
-            card = QFrame()
-            card.setObjectName("deviceCard")
-            card_layout = QVBoxLayout()
-            card_layout.setContentsMargins(8, 6, 8, 6)
-            card_layout.addWidget(QLabel(card_name(path)))
-            kind = path_kind(path)
-            card_layout.addWidget(QLabel(kind.title() if kind != "unknown" else "Device"))
-            card.setLayout(card_layout)
-            self.device_cards_row.addWidget(card)
-
-        self.device_input.setText(self.detected_devices[0])
-
-    def _combo_to_input(self, idx: int):
-        if idx < 0:
-            return
-        text = self.device_combo.itemText(idx)
-        if "Nenhum Razer" not in text:
-            self.device_input.setText(text)
-
-    def _codes_for_label(self, label: str, fallback_code: str) -> List[str]:
-        if label in self.dynamic_aliases:
-            return self.dynamic_aliases[label]
-        if fallback_code.startswith("BTN_"):
-            return MOUSE_ALIASES.get(label, [fallback_code])
-        return KEY_ALIASES.get(label, [fallback_code])
-
-    def _filter_paths_for_mappings(
-        self,
-        paths: List[str],
-        mappings: Dict[str, Action] | None = None,
-    ) -> List[str]:
-        mapping_source = mappings if mappings is not None else self.mappings
-        mapped_codes = extract_mapped_codes(mapping_source)
-        if not mapped_codes:
-            return paths
-
-        selected: List[str] = []
-        for path in paths:
-            try:
-                device = InputDevice(path)
-                supported = set(device.capabilities(absinfo=False).get(ecodes.EV_KEY, []))
-                device.close()
-                if supported & mapped_codes:
-                    selected.append(path)
-            except Exception:  # noqa: BLE001
-                # If device cannot be inspected (permissions), keep it for runtime attempt.
-                selected.append(path)
-
-        return selected or paths
-
-    def closeEvent(self, event):
+        self.window_monitor.stop()
+        self.device_manager.stop_monitoring()
         self._stop_capture()
-        if self.service_thread and self.service_thread.is_alive():
-            self.service_thread.join(timeout=0.2)
-        self._stop_sync()
+        if self.remap_service.is_active():
+            self.remap_service.stop_all()
+            if self.remap_service._thread and self.remap_service._thread.is_alive():
+                self.remap_service._thread.join(timeout=0.5)
+        self.tray_icon.hide()
         super().closeEvent(event)
 
 
-def launch():
-    verbose_input = os.getenv("SYNAPSE_VERBOSE_INPUT", "").lower() in {"1", "true", "yes", "on"}
+def launch() -> None:
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=logging.INFO,
             format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
             datefmt="%H:%M:%S",
         )
-    if not verbose_input:
-        logging.getLogger("synapse_like.remap.mapper").setLevel(logging.WARNING)
-
-    logger.info("Starting Synapse-like GUI")
-    if not verbose_input:
-        logger.info("Mapper input logs em modo reduzido (set SYNAPSE_VERBOSE_INPUT=1 para debug).")
     app = QApplication.instance() or QApplication([])
-    app_icon = build_app_icon()
-    app.setWindowIcon(app_icon)
+    icon = build_app_icon()
+    app.setWindowIcon(icon)
     app.setApplicationName("synapse-like")
     app.setApplicationDisplayName("Synapse-Like")
     if hasattr(app, "setDesktopFileName"):
         app.setDesktopFileName("synapse-like")
-
-    gui = RemapGUI(app_icon=app_icon)
-    gui.show()
+    window = RemapGUI(app_icon=icon)
+    window.show()
     app.exec()
 
 

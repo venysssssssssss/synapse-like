@@ -1,13 +1,9 @@
 import logging
-from typing import List
+from typing import Any, List
 
-from synapse_like.core.models import (
-    Device,
-    DeviceType,
-    DeviceCapabilities,
-    LightingCapabilities,
-    MacroCapabilities,
-)
+from synapse_like.core.models import Device, Profile
+from synapse_like.core.device_provider import DeviceProvider
+from synapse_like.adapters.openrazer.capabilities import get_extractor
 
 try:
     from openrazer.client import DeviceManager
@@ -15,11 +11,10 @@ try:
     OPENRAZER_AVAILABLE = True
 except ImportError:
     OPENRAZER_AVAILABLE = False
-    # Keep import quiet for GUI-only usage; CLI commands already report availability.
     logging.getLogger(__name__).debug("OpenRazer python bindings not found. Running in mock mode.")
 
 
-class OpenRazerAdapter:
+class OpenRazerAdapter(DeviceProvider):
     def __init__(self):
         if OPENRAZER_AVAILABLE:
             self.device_manager = DeviceManager()
@@ -36,7 +31,8 @@ class OpenRazerAdapter:
 
         devices: List[Device] = []
         for dev in self.device_manager.devices:
-            capabilities = self._extract_capabilities(dev)
+            extractor = get_extractor(dev)
+            capabilities = extractor.extract(dev)
             devices.append(
                 Device(
                     name=dev.name,
@@ -46,53 +42,7 @@ class OpenRazerAdapter:
             )
         return devices
 
-    def _extract_capabilities(self, dev) -> DeviceCapabilities:
-        """Translate OpenRazer device into stable capability object."""
-        dev_type = DeviceType.UNKNOWN
-        if getattr(dev, "type", None) == "keyboard":
-            dev_type = DeviceType.KEYBOARD
-        elif getattr(dev, "type", None) == "mouse":
-            dev_type = DeviceType.MOUSE
-
-        lighting = None
-        if dev.has("lighting"):
-            lighting = LightingCapabilities(
-                modes=self._lighting_modes(dev),
-                brightness=dev.has("brightness"),
-            )
-
-        device_id = self._device_id(dev)
-
-        return DeviceCapabilities(
-            device_id=device_id,
-            type=dev_type,
-            lighting=lighting,
-            dpi=dev.has("dpi"),
-            polling_rate=dev.has("polling_rate"),
-            macros=MacroCapabilities(supported=dev.has("macro")),
-        )
-
-    def _lighting_modes(self, dev) -> List[str]:
-        """Best-effort discovery of lighting modes."""
-        modes = []
-        for candidate in ("static", "breathing", "spectrum"):
-            if dev.has(candidate):
-                modes.append(candidate)
-        # Fallback to common defaults
-        return modes or ["static"]
-
-    def _device_id(self, dev) -> str:
-        """Compose stable device_id like usb:1532:011a."""
-        vid = getattr(dev, "usb_vid", None)
-        pid = getattr(dev, "usb_pid", None)
-        if vid and pid:
-            return f"usb:{vid:04x}:{pid:04x}"
-        product = getattr(dev, "product_id", None)
-        if product:
-            return f"usb:{product}"
-        return getattr(dev, "serial", "unknown")
-
-    def apply_profile(self, profile):
+    def apply_profile(self, profile: Profile) -> None:
         """
         Apply a profile to all connected devices.
         Real hardware commands are no-ops when OpenRazer is unavailable.
@@ -103,44 +53,95 @@ class OpenRazerAdapter:
             return
 
         for dev in devices:
+            # dev is our Model, but we need the raw openrazer device to apply things.
+            # We match them by serial. Alternatively, we could retrieve from device_manager directly.
+            # We find the matching openrazer raw device via serial
+            raw_dev = self._find_raw_device_by_serial(dev.serial)
+            if not raw_dev:
+                continue
+
             settings = profile.settings.get(dev.capabilities.device_id)
             if not settings:
                 continue
+            
             if dev.capabilities.lighting and settings.get("lighting"):
-                self._apply_lighting(dev, settings["lighting"])
+                self._apply_lighting(raw_dev, settings["lighting"])
             if dev.capabilities.dpi and settings.get("dpi"):
-                self._apply_dpi(dev, settings["dpi"])
+                self._apply_dpi(raw_dev, settings["dpi"])
             if dev.capabilities.polling_rate and settings.get("polling_rate"):
-                self._apply_polling(dev, settings["polling_rate"])
+                self._apply_polling(raw_dev, settings["polling_rate"])
 
-    def _apply_lighting(self, dev, cfg):
+    def persist_profile(self, profile_name: str, payload: dict) -> str:
+        """
+        Best-effort persistence for devices that expose onboard profile APIs.
+        The exact OpenRazer surface varies by hardware, so this probes common hooks.
+        """
         if not OPENRAZER_AVAILABLE:
-            logging.info("Mock apply lighting: %s -> %s", dev.name, cfg)
+            return "OpenRazer indisponivel no ambiente atual."
+
+        persisted = 0
+        for raw_dev in self.device_manager.devices:
+            if self._persist_on_device(raw_dev, profile_name, payload):
+                persisted += 1
+
+        if persisted == 0:
+            return "Nenhum dispositivo conectado expôs API de persistência onboard."
+        return f"Perfil persistido em {persisted} dispositivo(s) compatível(is)."
+
+    def _find_raw_device_by_serial(self, serial):
+        if not OPENRAZER_AVAILABLE:
+            return None
+        for dev in self.device_manager.devices:
+            if getattr(dev, "serial", None) == serial:
+                return dev
+        return None
+
+    def _apply_lighting(self, raw_dev, cfg):
+        if not OPENRAZER_AVAILABLE:
+            logging.info("Mock apply lighting: %s -> %s", raw_dev.name, cfg)
             return
         try:
-            if "brightness" in cfg and dev.has("brightness"):
-                dev.brightness = int(cfg["brightness"])
-            if "mode" in cfg and hasattr(dev, "set_effect"):
-                dev.set_effect(cfg["mode"])
+            if "brightness" in cfg and raw_dev.has("brightness"):
+                raw_dev.brightness = int(cfg["brightness"])
+            if "mode" in cfg and hasattr(raw_dev, "set_effect"):
+                raw_dev.set_effect(cfg["mode"])
         except Exception as exc:
-            logging.error("Failed to apply lighting to %s: %s", dev.name, exc)
+            logging.error("Failed to apply lighting to %s: %s", raw_dev.name, exc)
 
-    def _apply_dpi(self, dev, value: int):
+    def _apply_dpi(self, raw_dev, value: int):
         if not OPENRAZER_AVAILABLE:
-            logging.info("Mock apply DPI: %s -> %s", dev.name, value)
+            logging.info("Mock apply DPI: %s -> %s", raw_dev.name, value)
             return
         try:
-            if dev.has("dpi"):
-                dev.dpi = int(value)
+            if raw_dev.has("dpi"):
+                raw_dev.dpi = int(value)
         except Exception as exc:
-            logging.error("Failed to set DPI on %s: %s", dev.name, exc)
+            logging.error("Failed to set DPI on %s: %s", raw_dev.name, exc)
 
-    def _apply_polling(self, dev, value: int):
+    def _apply_polling(self, raw_dev, value: int):
         if not OPENRAZER_AVAILABLE:
-            logging.info("Mock apply polling: %s -> %s", dev.name, value)
+            logging.info("Mock apply polling: %s -> %s", raw_dev.name, value)
             return
         try:
-            if dev.has("polling_rate"):
-                dev.polling_rate = int(value)
+            if raw_dev.has("polling_rate"):
+                raw_dev.polling_rate = int(value)
         except Exception as exc:
-            logging.error("Failed to set polling on %s: %s", dev.name, exc)
+            logging.error("Failed to set polling on %s: %s", raw_dev.name, exc)
+
+    def _persist_on_device(self, raw_dev: Any, profile_name: str, payload: dict) -> bool:
+        candidate_calls = (
+            ("save_profile", (profile_name, payload)),
+            ("persist_profile", (profile_name, payload)),
+            ("set_profile", (profile_name,)),
+        )
+        for attr_name, args in candidate_calls:
+            method = getattr(raw_dev, attr_name, None)
+            if not callable(method):
+                continue
+            try:
+                method(*args)
+                return True
+            except Exception as exc:
+                logging.error("Failed to persist profile on %s via %s: %s", raw_dev.name, attr_name, exc)
+                return False
+        return False
