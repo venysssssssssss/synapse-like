@@ -30,7 +30,7 @@ Este documento define os passos restantes para elevar a arquitetura, performance
 
 - [x] **Core em Rust/C++ (Opcional/Futuro)**
     - **Meta:** Substituir apenas o loop `while` de leitura/escrita por um módulo compilado (via PyO3 ou ctypes) para latência de hardware nativa.
-    - **Status:** Implementação em Rust (`synapse_native`) criada usando PyO3. Pronta para compilação com `maturin`.
+    - **Status:** Protótipo em Rust (`synapse_native`) isolado em `native/synapse_native/`, pronto para evolução/compilação com `maturin`.
 
 ## 3. Visual (Interface Moderna)
 
